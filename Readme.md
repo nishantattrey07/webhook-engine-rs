@@ -1,70 +1,165 @@
-# Concurrent Webhook Engine - Version 0
+# Webhook Engine (Rust)
 
-## Goal
+A learning-focused project that incrementally builds a production-grade webhook delivery system from first principles.
 
-Build the simplest possible webhook producer engine before introducing retries, worker pools, channels, HTTP delivery, concurrency, or databases.
+The goal is not to copy a production architecture on day one.
 
-The purpose of Version 0 is to validate the core lifecycle of a webhook event.
+The goal is to understand why production systems evolve into their final form by building the system one layer at a time, measuring bottlenecks, and only introducing additional complexity when a real limitation is discovered.
 
 ---
 
-# What I have Built
+## Philosophy
 
-## In-Memory Storage
+Every version follows the same process:
 
-I created an `InMemoryStore` that simulates a database.
+```text
+Build the simplest version
+↓
+Measure behavior
+↓
+Identify the bottleneck
+↓
+Upgrade only what is necessary
+↓
+Measure again
+```
 
-It stores:
+No architecture is added simply because "production systems use it".
 
-* Payments
-* Domain Events
+Every upgrade must solve a discovered problem.
 
-using Rust `HashMap`s.
+---
+
+## Learning Goals
+
+This project is being used to deeply understand:
+
+* Rust concurrency
+* Worker pools
+* Channels
+* Shared state
+* Backpressure
+* Retry systems
+* Dead-letter queues
+* Reliability engineering
+* Webhook delivery architecture
+* Outbox Pattern
+* Distributed systems fundamentals
+
+---
+
+## Current Progress
+
+### Version 0 — Event Lifecycle and Outbox Simulation ✅
+
+Implemented:
+
+```text
+Payment Creation
+Event Creation
+In-Memory Store
+Outbox Simulation
+Delivery Simulation
+Event State Transitions
+Metrics
+Invariant Validation
+```
+
+Planned:
+
+```text
+Version 1 → Retry System
+Version 2 → Real HTTP Delivery
+Version 3 → Worker Pool
+Version 4 → Concurrency & Channels
+Version 5 → Load Testing
+Version 6 → Backpressure
+Version 7 → Async Runtime Investigation
+```
+
+---
+
+# Version 0
+
+Version 0 focuses on validating the core webhook event lifecycle before introducing retries, networking, concurrency, or persistence.
+
+The objective is correctness, not performance.
+
+---
+
+## Architecture
+
+```text
+Payment
+↓
+Domain Event
+↓
+Pending
+↓
+Delivered / DeadLettered
+```
+
+---
+
+## In-Memory Store
+
+The system currently uses an in-memory store built with Rust HashMaps.
+
+Stored entities:
+
+```text
+Payments
+Domain Events
+```
+
+The store simulates a database while keeping the system simple enough to reason about.
 
 ---
 
 ## Auto Increment IDs
 
-To simulate database-generated primary keys:
+Real databases generate primary keys automatically.
+
+Since Version 0 uses an in-memory store, IDs are generated manually using counters:
 
 ```text
 next_payment_id
 next_event_id
 ```
 
-are maintained inside the store.
-
-Every new payment/event receives a unique identifier.
+These simulate database-generated identifiers.
 
 ---
 
 ## Payment Creation
 
-A payment contains:
+Each payment contains:
 
-* payment_id
-* merchant_id
-* order_id
-* amount
-* payment status
-* payment method
-* created_at timestamp
+```text
+payment_id
+merchant_id
+order_id
+amount
+payment_status
+payment_method
+created_at
+```
 
 ---
 
 ## Event Creation
 
-For every payment, a corresponding event is created.
+Every payment creates exactly one domain event.
 
-Mapping:
+Mappings:
 
 ```text
-Succeeded -> PaymentSucceeded
-Failed    -> PaymentFailed
-Refunded  -> PaymentRefund
+Succeeded → PaymentSucceeded
+Failed    → PaymentFailed
+Refunded  → PaymentRefund
 ```
 
-Initial state:
+Initial event state:
 
 ```text
 Pending
@@ -74,9 +169,9 @@ Pending
 
 ## Atomic Capture Simulation
 
-Version 0 simulates the Outbox Pattern.
+Version 0 simulates the core idea behind the Outbox Pattern.
 
-A single business operation:
+A single operation:
 
 ```text
 create_payment_and_event()
@@ -87,24 +182,23 @@ creates:
 ```text
 Payment
 +
-Event
+Domain Event
 ```
 
 together.
 
-Invariant:
+Business invariant:
 
 ```text
-Payment Exists
-⇔
-Event Exists
+Every successfully created payment
+must have exactly one corresponding event.
 ```
 
 ---
 
-## Event Lifecycle
+## Event States
 
-Events currently support:
+Current event states:
 
 ```text
 Pending
@@ -116,7 +210,7 @@ DeadLettered
 
 ## Delivery Simulation
 
-Version 0 does not use HTTP.
+Version 0 intentionally avoids real HTTP delivery.
 
 Instead:
 
@@ -132,9 +226,9 @@ TemporaryFailure
 PermanentFailure
 ```
 
-deterministically based on merchant_id.
+based on deterministic rules.
 
-This makes test runs reproducible.
+This keeps test runs reproducible and debugging simple.
 
 ---
 
@@ -142,9 +236,11 @@ This makes test runs reproducible.
 
 Current metrics:
 
-* Pending Events
-* Delivered Events
-* DeadLettered Events
+```text
+Pending Events
+Delivered Events
+DeadLettered Events
+```
 
 ---
 
@@ -156,128 +252,126 @@ Version 0 validates:
 payments.len() == domain_events.len()
 ```
 
-This ensures every payment has a corresponding event.
+This ensures every payment has a corresponding domain event.
 
 ---
 
-# What Version 0 Does NOT Have
+# What Version 0 Does Not Include
 
-## No Retry Logic
+## Retry System
+
+Not implemented yet.
 
 Temporary failures remain pending.
 
-There is currently no retry counter.
+Missing:
+
+```text
+retry_count
+max_retry_limit
+retry scheduling
+backoff strategy
+```
 
 ---
 
-## No Dead Letter Queue Logic
+## Real HTTP Delivery
 
-Events can be marked dead-lettered.
+Webhook delivery is currently simulated.
 
-However:
-
-* retry limits
-* retry exhaustion
-* DLQ processing
-
-do not exist yet.
+No network requests occur.
 
 ---
 
-## No HTTP Delivery
+## Worker Pool
 
-Webhook delivery is simulated through a function.
+No worker threads exist.
 
-No real network calls occur.
-
----
-
-## No Worker Pool
-
-Everything runs on a single thread.
+All processing is single-threaded.
 
 ---
 
-## No Channels
+## Channels
 
 No producer-consumer architecture exists yet.
 
 ---
 
-## No Concurrency
+## Concurrency
 
-No threads.
-
-No Arc.
-
-No Mutex.
-
-No synchronization primitives.
-
----
-
-## No Persistence
-
-Data is stored entirely in memory.
-
-Restarting the process loses all state.
-
----
-
-# Known Design Limitations
-
-1. Atomicity is simulated.
-   HashMap inserts cannot truly model database transactions.
-
-2. Delivery outcomes are simulated.
-   No real merchant endpoints exist yet.
-
-3. Events do not track retry attempts.
-
-4. No recovery exists after process restart.
-
----
-
-# Why Version 0 Exists
-
-Version 0 is intentionally simple.
-
-The objective is not performance.
-
-The objective is proving the core event lifecycle:
+Version 0 does not use:
 
 ```text
-Payment
-↓
-Event
-↓
-Pending
-↓
-Delivered / DeadLettered
+Arc
+Mutex
+RwLock
+Channels
+Thread Pools
 ```
-
-before introducing additional complexity.
 
 ---
 
-# Next Planned Upgrade (Version 1)
+## Persistence
 
-Introduce retry support.
+All data lives in memory.
 
-Changes:
+Restarting the application loses all state.
+
+---
+
+# Known Limitations
+
+1. Atomicity is simulated, not guaranteed by a database transaction.
+
+2. Delivery outcomes are simulated instead of coming from real merchant endpoints.
+
+3. Events do not track delivery attempts.
+
+4. No retry system exists.
+
+5. No persistence exists after process restart.
+
+6. No concurrency exists.
+
+---
+
+# Why This Project Exists
+
+Modern payment systems cannot safely send webhooks directly from request handlers.
+
+They must deal with:
 
 ```text
-Event.retry_count
+Retries
+Failures
+Timeouts
+Backpressure
+Concurrency
+Process Crashes
+Network Partitions
+Dead Letter Queues
 ```
 
-Workflow:
+This project explores those problems incrementally.
+
+Each version introduces a new reliability mechanism and demonstrates why it is necessary.
+
+The final goal is not simply a webhook sender.
+
+The final goal is understanding how reliable event delivery systems are designed.
+
+---
+
+# next version
+
+## Version 1
+
+Retry System
 
 ```text
 Pending
 ↓
 Temporary Failure
-↓
-retry_count += 1
 ↓
 Retry
 ↓
@@ -290,4 +384,6 @@ Max Retries Reached
 DeadLettered
 ```
 
-This will be the first meaningful reliability improvement.
+---
+
+
