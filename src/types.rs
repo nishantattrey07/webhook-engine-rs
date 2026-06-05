@@ -1,6 +1,7 @@
 use std::time::Instant;
 use std::collections::HashMap;
 
+
 #[derive(Debug, Clone,PartialEq)]
 pub enum PaymentStatus {
     Succeeded,
@@ -70,7 +71,8 @@ pub struct Event{
     pub event_type:EventType,
     pub object_id:u64,
     pub merchant_id:u64,
-    pub status:EventStatus
+    pub status:EventStatus,
+    pub retry_count:u64
 }
 
 #[derive(Debug, Clone,PartialEq)]
@@ -104,9 +106,18 @@ impl InMemoryStore {
                 PaymentStatus::Refunded=>EventType::PaymentRefund
             };
 
-          let payment_id =  self.insert_payment(merchant_id, order_id, amount, status, mode_of_payment);
+          let payment_id =  self.insert_payment(
+              merchant_id,
+              order_id,
+              amount,
+              status,
+              mode_of_payment);
         
-          let event_id = self.insert_event(merchant_id, payment_id, event_type, EventStatus::Pending);
+          let event_id = self.insert_event(
+              merchant_id,
+              payment_id,
+              event_type,
+              EventStatus::Pending);
 
           (payment_id,event_id)
             
@@ -144,7 +155,7 @@ impl InMemoryStore {
         event_status:EventStatus)->u64{
 
             let event_id =self.next_event_id;
-            let event:Event= Event { event_id, event_type, object_id, merchant_id, status: event_status };
+            let event:Event= Event { event_id, event_type, object_id, merchant_id, status: event_status,retry_count:0 };
             self.domain_events.insert(event_id, event);
             self.next_event_id+=1;
         
@@ -156,10 +167,11 @@ impl InMemoryStore {
   
 
 
-    pub fn pending_events(&self)->Vec<&Event>{
+    pub fn pending_events(&mut self)->Vec<&mut Event>{
         
-        self.domain_events.values()
-            .filter(|v|v.status==EventStatus::Pending).collect()
+        self.domain_events.values_mut()
+            .filter(|v|v.status==EventStatus::Pending)
+            .collect()
     }
 
     pub fn delivered_events(&self)->Vec<&Event>{
@@ -182,7 +194,7 @@ impl InMemoryStore {
     }
 
 
-    pub fn event_pending_count(&self)->i32{
+    pub fn event_pending_count(&self)->u64{
         let mut count = 0;
         for _ in self.domain_events.iter().map(|(_,d)| d).filter(|v| v.status==EventStatus::Pending){
             count+=1;
@@ -191,7 +203,7 @@ impl InMemoryStore {
         count
     }
 
-    pub fn event_delivered_count(&self)->i32{
+    pub fn event_delivered_count(&self)->u64{
         let mut count = 0;
         for _ in self.domain_events.iter().map(|(_,d)| d).filter(|v| v.status==EventStatus::Delivered){
             count+=1;
@@ -200,7 +212,7 @@ impl InMemoryStore {
         count
     }
 
-    pub fn event_deadlettered_count(&self)->i32{
+    pub fn event_deadlettered_count(&self)->u64{
         let mut count = 0;
         for _ in self.domain_events.iter().map(|(_,d)| d).filter(|v| v.status==EventStatus::DeadLettered){
             count+=1;
@@ -211,7 +223,8 @@ impl InMemoryStore {
 
 
     pub fn verify_invariant(&self){
-        if self.payments.len() == self.domain_events.len(){
+        let count:u64 = self.event_deadlettered_count()+self.event_delivered_count();
+        if count == self.domain_events.len() as u64{
             println!("PASS");
         }else{
            println!("FAIL"); 
