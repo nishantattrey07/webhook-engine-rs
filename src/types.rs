@@ -1,8 +1,8 @@
 use std::time::Instant;
 use std::collections::HashMap;
+use serde::{Deserialize, Serialize};
 
-
-#[derive(Debug, Clone,PartialEq)]
+#[derive(Debug, Clone,PartialEq,Serialize, Deserialize)]
 pub enum PaymentStatus {
     Succeeded,
     Failed,
@@ -16,13 +16,13 @@ pub enum EventStatus{
     DeadLettered
 }
 
-#[derive(Debug, Clone,PartialEq)]
+#[derive(Debug, Clone,PartialEq,Serialize, Deserialize)]
 pub enum CardType{
     Credit,
     Debit
 }
 
-#[derive(Debug, Clone,PartialEq)]
+#[derive(Debug, Clone,PartialEq,Serialize, Deserialize)]
 pub enum ModeOfPayment{
     Cash,
     Card(CardType),
@@ -30,7 +30,7 @@ pub enum ModeOfPayment{
     Upi  
 }
 
-#[derive(Debug, Clone,PartialEq)]
+#[derive(Debug, Clone,PartialEq,Serialize, Deserialize)]
 pub enum EventType{
     PaymentSucceeded,
     PaymentFailed,
@@ -42,6 +42,7 @@ pub enum DeliveryOutcome {
     Success,
     TemporaryFailure,
     PermanentFailure,
+    Timeout
 }
 
 
@@ -63,6 +64,22 @@ pub struct Payment{
         pub amount:i64,
         pub status:PaymentStatus,
         pub created_at:Instant,    
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WebhookPayloadData {  
+    pub payment_id: u64,
+    pub order_id: u64,
+    pub mode_of_payment: ModeOfPayment,
+    pub amount: i64,
+    pub status: PaymentStatus,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WebhookPayload {
+    pub event_id: u64,
+    pub event_type: EventType,
+    pub data: WebhookPayloadData,
 }
 
 #[derive(Debug, Clone,PartialEq)]
@@ -167,10 +184,11 @@ impl InMemoryStore {
   
 
 
-    pub fn pending_events(&mut self)->Vec<&mut Event>{
-        
-        self.domain_events.values_mut()
-            .filter(|v|v.status==EventStatus::Pending)
+    pub fn pending_events(&self) -> Vec<u64> {
+        self.domain_events
+            .values()
+            .filter(|v| v.status == EventStatus::Pending)
+            .map(|v| v.event_id) 
             .collect()
     }
 

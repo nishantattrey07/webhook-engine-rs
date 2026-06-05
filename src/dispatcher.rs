@@ -9,7 +9,7 @@ pub fn run_dispatcher(db:&mut InMemoryStore)->bool{
     let collection = db.pending_events();
 
     for event in collection{
-        run_worker(event);
+        run_worker(db,event);
     }
 
     true

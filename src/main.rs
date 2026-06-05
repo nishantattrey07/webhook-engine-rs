@@ -1,7 +1,7 @@
 use webhook_engine::types::InMemoryStore;
 use webhook_engine::payment_service::add_payments_db;
 use webhook_engine::dispatcher:: run_dispatcher;
-use webhook_engine::retry::retry;
+// use webhook_engine::retry::retry;
 
 
 
@@ -10,7 +10,8 @@ use webhook_engine::retry::retry;
 
 
 
-fn main() {
+
+fn main(){
     let mut store = InMemoryStore::new();
 
     add_payments_db(&mut store);
@@ -38,7 +39,7 @@ fn main() {
     println!("*************************************");
     println!("After retry");
     println!(" ");
-        retry(&mut store);
+        // retry(&mut store);
     
     println!("Delivered Events: {:#?}",store.event_delivered_count());
     println!("Pending Events: {:#?}",store.event_pending_count());
@@ -50,6 +51,6 @@ fn main() {
     store.verify_invariant();
     println!(" ");
 
-    
+
     
 }
