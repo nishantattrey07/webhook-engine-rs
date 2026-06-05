@@ -1,7 +1,7 @@
 use crate::types::{DeliveryOutcome, EventStatus,Event};
 use crate::queue::RETRY_QUEUE;
 use crate::webhook_simulator::simulate_delivery;
-
+const MAX_ATTEMPT:u64 = 5;
 
 pub fn run_worker(event:&mut Event){
         if event.status==EventStatus::Pending{
@@ -15,13 +15,20 @@ pub fn run_worker(event:&mut Event){
                 DeliveryOutcome::Success => 
                    event.mark_event_delivered(),
                 DeliveryOutcome::TemporaryFailure =>{
-                    event.mark_event_pending();
-                    // i am still not good with this line section
-                    // help me understand it properly
-                    RETRY_QUEUE.with(|queue_cell|{
-                        let mut queue = queue_cell.borrow_mut();
-                        queue.push_back(event.event_id.clone());
-                    })
+
+                    if event.attempt_count >= MAX_ATTEMPT {
+                        event.mark_event_deadlettered();
+                    }
+                    else{
+                        event.mark_event_pending();
+                        // i am still not good with this line section
+                        // help me understand it properly
+                        RETRY_QUEUE.with(|queue_cell|{
+                            let mut queue = queue_cell.borrow_mut();
+                            queue.push_back(event.event_id.clone());
+                        })
+                    }
+                    
                 },
                 DeliveryOutcome::PermanentFailure =>
                     event.mark_event_deadlettered(),
