@@ -1,6 +1,6 @@
 use crate::types::{DeliveryOutcome, EventStatus, InMemoryStore, WebhookPayload, WebhookPayloadData};
 use crate::queue::RETRY_QUEUE;
-use crate::webhook_simulator::{test_call};
+use crate::webhook_simulator::{send_webhook};
 const MAX_ATTEMPT:u64 = 5;
  
 pub fn run_worker(db:&mut InMemoryStore,event_id:u64){
@@ -26,7 +26,7 @@ pub fn run_worker(db:&mut InMemoryStore,event_id:u64){
 
            
            event.attempt_count+=1;
-           let outcome = test_call(
+           let outcome = send_webhook(
                event.merchant_id,
                payload
            );

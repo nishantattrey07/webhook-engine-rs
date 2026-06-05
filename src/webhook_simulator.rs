@@ -8,7 +8,7 @@ use ureq::Agent;
 //     DnsFailure,
 // }
 
-pub fn test_call(
+pub fn send_webhook(
     merchant_id: u64,
     payload: WebhookPayload,
 ) -> Result<DeliveryOutcome, Box<dyn std::error::Error>> {
