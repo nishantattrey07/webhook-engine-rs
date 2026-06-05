@@ -26,18 +26,12 @@ pub fn run_worker(db:&mut InMemoryStore,event_id:u64){
 
            
            event.attempt_count+=1;
-           let outcome = send_webhook(
+           let result = send_webhook(
                event.merchant_id,
                payload
            );
 
-           let result = match outcome{
-               Ok(data)=>data,
-               Err(err)=> {
-                    eprintln!("Error occurred while sending webhook: {}", err);
-                    return;
-               }
-           };
+        
 
            match result {
                DeliveryOutcome::Success => 

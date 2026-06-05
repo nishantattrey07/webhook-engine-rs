@@ -8,10 +8,11 @@ use ureq::Agent;
 //     DnsFailure,
 // }
 
+
 pub fn send_webhook(
     merchant_id: u64,
     payload: WebhookPayload,
-) -> Result<DeliveryOutcome, Box<dyn std::error::Error>> {
+) -> DeliveryOutcome {
     let url = format!(
         "http://0.0.0.0:3000/webhook/{}",
         merchant_id
@@ -36,11 +37,17 @@ pub fn send_webhook(
                 merchant_id
             );
 
-            return Ok(DeliveryOutcome::Timeout);
+            return DeliveryOutcome::Timeout;
         }
 
         Err(err) => {
-            return Err(Box::new(err));
+            println!(
+                "Merchant-id: {}      transport-error: {}",
+                merchant_id,
+                err
+            );
+
+            return DeliveryOutcome::TemporaryFailure;
         }
     };
 
@@ -52,7 +59,7 @@ pub fn send_webhook(
         response.status()
     );
 
-    let outcome = match status_code {
+    match status_code {
         200..=299 => DeliveryOutcome::Success,
 
         429 => DeliveryOutcome::TemporaryFailure,
@@ -62,8 +69,5 @@ pub fn send_webhook(
         400..=499 => DeliveryOutcome::PermanentFailure,
 
         _ => DeliveryOutcome::TemporaryFailure,
-    };
-
-    Ok(outcome)
+    }
 }
-

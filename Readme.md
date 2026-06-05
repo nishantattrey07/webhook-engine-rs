@@ -24,7 +24,7 @@ Upgrade only what is necessary
 Measure again
 ```
 
-No architecture is added simply because “production systems use it”.
+No architecture is added simply because "production systems use it".
 
 Every upgrade must solve a discovered problem.
 
@@ -34,21 +34,23 @@ Every upgrade must solve a discovered problem.
 
 This project is being used to deeply understand:
 
-- Channels
-- Shared state
-- Backpressure
-- Retry systems
-- Dead-letter queues
-- Reliability engineering
-- Webhook delivery architecture
-- Outbox pattern
-- Distributed systems fundamentals
+* Webhook delivery systems
+* Reliability engineering
+* Retry systems
+* Dead-letter queues
+* Outbox pattern
+* Worker pools
+* Rust concurrency
+* Channels
+* Shared state
+* Backpressure
+* Distributed systems fundamentals
 
 ---
 
 ## Current Progress
 
-### Version 0 — Event Lifecycle and Outbox Simulation ✅
+### Version 0 — Event Lifecycle & Outbox Simulation ✅
 
 Implemented:
 
@@ -63,7 +65,9 @@ Metrics
 Invariant Validation
 ```
 
-### Version 1 — Retry System and Event Recovery ✅
+---
+
+### Version 1 — Retry System & Event Recovery ✅
 
 Implemented:
 
@@ -77,7 +81,7 @@ Dead Lettering
 Final Invariant Check
 ```
 
-Current retry semantics:
+Retry semantics:
 
 ```text
 1 initial attempt
@@ -85,10 +89,35 @@ Current retry semantics:
 = 5 total attempts
 ```
 
-The field used in the code is `attempt_count`, and it means:
+---
+
+### Version 2 — Real HTTP Delivery ✅
+
+Implemented:
 
 ```text
-current attempt number
+Real HTTP Delivery
+Webhook Payload Serialization
+HTTP Status Classification
+Client Timeout Handling
+Retryable Failures
+Permanent Failures
+Dead Letter Handling
+Invariant Validation
+```
+
+Delivery classification:
+
+```text
+2xx                     -> Success
+
+429                     -> TemporaryFailure
+
+5xx                     -> TemporaryFailure
+
+4xx                     -> PermanentFailure
+
+Client Timeout          -> Timeout
 ```
 
 ---
@@ -96,7 +125,6 @@ current attempt number
 ## Next
 
 ```text
-Version 2 → Real HTTP Delivery
 Version 3 → Worker Pool
 Version 4 → Concurrency & Channels
 Version 5 → Load Testing
@@ -108,7 +136,7 @@ Version 7 → Async Runtime Investigation
 
 # Version 0
 
-Version 0 focused on validating the core webhook event lifecycle before introducing retries, networking, concurrency, or persistence.
+Version 0 focused on validating the core webhook lifecycle before introducing retries, networking, concurrency, or persistence.
 
 The objective was correctness, not performance.
 
@@ -130,7 +158,7 @@ Delivered / DeadLettered
 
 ## In-Memory Store
 
-The system uses an in-memory store built with Rust HashMaps.
+The system uses Rust HashMaps to simulate a database.
 
 Stored entities:
 
@@ -139,64 +167,20 @@ Payments
 Domain Events
 ```
 
-The store simulates a database while keeping the system simple enough to reason about.
-
 ---
 
 ## Auto Increment IDs
 
-Real databases generate primary keys automatically.
-
-Since Version 0 uses an in-memory store, IDs are generated manually using counters:
+Database-generated IDs are simulated using:
 
 ```text
 next_payment_id
 next_event_id
 ```
 
-These simulate database-generated identifiers.
-
----
-
-## Payment Creation
-
-Each payment contains:
-
-```text
-payment_id
-merchant_id
-order_id
-amount
-payment_status
-payment_method
-created_at
-```
-
----
-
-## Event Creation
-
-Every payment creates exactly one domain event.
-
-Mappings:
-
-```text
-Succeeded → PaymentSucceeded
-Failed    → PaymentFailed
-Refunded  → PaymentRefund
-```
-
-Initial event state:
-
-```text
-Pending
-```
-
 ---
 
 ## Atomic Capture Simulation
-
-Version 0 simulated the core idea behind the Outbox Pattern.
 
 A single operation:
 
@@ -225,8 +209,6 @@ must have exactly one corresponding event.
 
 ## Event States
 
-Current event states:
-
 ```text
 Pending
 Delivered
@@ -237,15 +219,13 @@ DeadLettered
 
 ## Delivery Simulation
 
-Version 0 intentionally avoided real HTTP delivery.
-
-Instead:
+Version 0 intentionally avoided networking.
 
 ```rust
-simulate_delivery(merchant_id)
+simulate_delivery(...)
 ```
 
-returns:
+returned deterministic outcomes:
 
 ```text
 Success
@@ -253,15 +233,9 @@ TemporaryFailure
 PermanentFailure
 ```
 
-based on deterministic rules.
-
-This keeps test runs reproducible and debugging simple.
-
 ---
 
 ## Metrics
-
-Current metrics:
 
 ```text
 Pending Events
@@ -273,21 +247,19 @@ DeadLettered Events
 
 ## Invariant Validation
 
-Version 0 validated:
+Version 0 validates:
 
 ```text
 payments.len() == domain_events.len()
 ```
 
-This ensured every payment had a corresponding domain event.
-
 ---
 
 # Version 1
 
-Version 1 adds retry handling for temporary failures while keeping the system in-memory and single-threaded.
+Version 1 introduces retries while remaining entirely single-threaded.
 
-The objective is to prove that temporary failures are not terminal and that every event eventually reaches a terminal state.
+The objective is to prove that temporary failures are not terminal failures.
 
 ---
 
@@ -320,7 +292,7 @@ Retry Queue
 ↓
 Retry Processor
 ↓
-Max attempts exceeded
+Max Attempts Exceeded
 ↓
 DeadLettered
 
@@ -333,7 +305,7 @@ DeadLettered
 
 ## Retry Queue
 
-Version 1 uses a retry queue that stores:
+The retry queue stores:
 
 ```text
 event_id
@@ -341,9 +313,13 @@ event_id
 
 instead of full event objects.
 
-That keeps the queue lightweight and ensures the in-memory store remains the single source of truth.
+The in-memory store remains the source of truth.
 
-The queue is intentionally thread-local because Version 1 is still a single-threaded simulation.
+Current implementation:
+
+```rust
+VecDeque<u64>
+```
 
 ---
 
@@ -355,13 +331,11 @@ Each event tracks:
 attempt_count
 ```
 
-which means:
+Meaning:
 
 ```text
 current attempt number
 ```
-
-not “retries only”.
 
 Example:
 
@@ -375,8 +349,6 @@ Attempt 3 -> attempt_count = 3
 
 ## Retry Policy
 
-Version 1 uses:
-
 ```text
 MAX_ATTEMPT = 5
 ```
@@ -389,63 +361,27 @@ Meaning:
 = 5 total attempts
 ```
 
-If the event still fails temporarily after those attempts, it is dead-lettered.
-
 ---
 
 ## Dispatcher
 
-The dispatcher scans the store for pending events and hands them off for delivery.
+The dispatcher scans for pending events and schedules work.
 
-It does not own the event data.
-
-It only moves work forward.
+It does not own event state.
 
 ---
 
 ## Worker
 
-The worker performs the first delivery attempt.
+The worker performs delivery attempts and updates event state.
 
-If delivery succeeds, the event becomes `Delivered`.
-
-If delivery fails temporarily, the event is returned to the retry queue.
-
-If delivery fails permanently, the event becomes `DeadLettered`.
-
----
-
-## Retry Processor
-
-The retry processor drains the retry queue and tries the event again using the stored `attempt_count`.
-
-It updates the real event in the store, not a copied event in the queue.
-
-That keeps state consistent.
-
----
-
-## Event States
-
-Version 1 still uses:
+Possible outcomes:
 
 ```text
-Pending
-Delivered
-DeadLettered
+Success
+TemporaryFailure
+PermanentFailure
 ```
-
-`Pending` is used for events that have not yet reached a terminal state.
-
----
-
-## Delivery Simulation
-
-Version 1 still uses deterministic delivery simulation instead of real HTTP.
-
-This is intentional.
-
-The purpose of Version 1 is to validate retry behavior before network complexity is added in Version 2.
 
 ---
 
@@ -457,39 +393,205 @@ Version 1 validates:
 Delivered + DeadLettered == Total Events
 ```
 
-This ensures every event reaches a terminal state.
+---
+
+# Version 2
+
+Version 2 replaces simulated delivery with real HTTP communication.
+
+The objective is to validate delivery behavior against real network conditions before introducing concurrency.
+
+Version 2 intentionally remains single-threaded.
 
 ---
 
-## Known Limitations of Version 1
+## Version 2 Architecture
 
-### Simulated delivery
+```text
+Payment
+↓
+Domain Event
+↓
+Pending
+↓
+Dispatcher
+↓
+Worker
+↓
+HTTP POST
+↓
+Mock Merchant Server
+```
 
-Delivery outcomes are still generated by `simulate_delivery(...)` instead of real HTTP requests.
+---
+
+## Real Webhook Delivery
+
+Version 2 removes:
+
+```rust
+simulate_delivery(...)
+```
+
+and replaces it with:
+
+```rust
+send_webhook(...)
+```
+
+using:
+
+```text
+ureq
+```
+
+as a blocking HTTP client.
+
+---
+
+## Webhook Payload
+
+A dedicated transport model is used instead of exposing internal storage models.
+
+Payload contains:
+
+```text
+event_id
+event_type
+
+payment_id
+order_id
+amount
+payment_status
+payment_method
+```
+
+This separates internal storage concerns from external API contracts.
+
+---
+
+## Delivery Outcome Classification
+
+HTTP responses are mapped into delivery outcomes.
+
+Current rules:
+
+```text
+2xx                     -> Success
+
+429                     -> TemporaryFailure
+
+5xx                     -> TemporaryFailure
+
+4xx                     -> PermanentFailure
+
+Client Timeout          -> Timeout
+```
+
+This is the first version where the engine becomes network-aware.
+
+---
+
+## Timeout Handling
+
+Version 2 introduces client-side delivery deadlines.
+
+A timeout is defined by the webhook engine, not by the merchant.
+
+Example:
+
+```text
+Request Sent
+↓
+Merchant Responds Too Slowly
+↓
+Client Deadline Exceeded
+↓
+Timeout
+```
+
+---
+
+## Retry Behavior
+
+Retryable outcomes:
+
+```text
+TemporaryFailure
+Timeout
+```
+
+Non-retryable outcomes:
+
+```text
+PermanentFailure
+```
+
+---
+
+## Dead Letter Handling
+
+Events become dead-lettered when:
+
+```text
+PermanentFailure
+```
+
+or
+
+```text
+Maximum Attempts Exceeded
+```
+
+Dead-lettered events remain visible in the event store.
+
+This acts as a simple in-memory Dead Letter Queue.
+
+---
+
+## Final Invariant
+
+Version 2 validates:
+
+```text
+Delivered + DeadLettered == Total Events
+```
+
+ensuring no event disappears from the delivery lifecycle.
+
+---
+
+## Known Limitations of Version 2
+
+### Blocking HTTP
+
+The worker performs synchronous network requests.
+
+No async runtime is used.
 
 ### Single-threaded execution
 
-Dispatcher, worker, and retry logic are still executed in a single-threaded flow.
+Dispatcher, worker, retry processing, and delivery all execute on a single thread.
 
-### Simplified state model
-
-The event lifecycle does not yet include richer states such as `RetryScheduled` or `Processing`.
-
-### In-memory only
+### In-memory state
 
 All state is lost when the process exits.
 
+### Simplified state model
+
+Current event states:
+
+```text
+Pending
+Delivered
+DeadLettered
+```
+
+No intermediate states currently exist.
+
 ---
 
-# What the Current System Does Not Include Yet
-
-## Real HTTP Delivery
-
-Webhook delivery is still simulated.
-
-No network requests occur yet.
-
----
+# What The Current System Does Not Include Yet
 
 ## Worker Pool
 
@@ -499,7 +601,7 @@ All processing is still single-threaded.
 
 ---
 
-## Channels and Concurrency
+## Channels & Concurrency
 
 The project does not yet use:
 
@@ -517,18 +619,33 @@ Thread Pools
 
 All data lives in memory.
 
-Restarting the application loses all state.
+Restarting the process loses all state.
+
+---
+
+## Retry Scheduling
+
+Retries happen immediately.
+
+There is currently:
+
+```text
+No Delay
+No Backoff
+No Jitter
+```
 
 ---
 
 # Known Limitations
 
-1. Atomicity is simulated, not guaranteed by a database transaction.
-2. Delivery outcomes are simulated instead of coming from real merchant endpoints.
+1. Atomicity is simulated rather than enforced by database transactions.
+2. Delivery uses blocking HTTP.
 3. Events do not yet model richer delivery states.
-4. No real retry backoff exists yet.
-5. No persistence exists after process restart.
+4. Retry scheduling has no delay or backoff strategy.
+5. State is not persisted across process restarts.
 6. No concurrency exists yet.
+7. Transport errors are not yet modeled with a dedicated error type.
 
 ---
 
@@ -536,7 +653,7 @@ Restarting the application loses all state.
 
 Modern payment systems cannot safely send webhooks directly from request handlers.
 
-They must deal with:
+They must handle:
 
 ```text
 Retries
@@ -551,35 +668,19 @@ Dead Letter Queues
 
 This project explores those problems incrementally.
 
-Each version introduces a new reliability mechanism and demonstrates why it is necessary.
+Each version introduces a new reliability mechanism and demonstrates why it exists.
 
-The final goal is not simply a webhook sender.
+The goal is not simply to build a webhook sender.
 
-The final goal is understanding how reliable event delivery systems are designed.
+The goal is to understand how reliable event delivery systems are designed.
 
 ---
 
 # Planned Roadmap
 
-## Version 2 — Real HTTP Delivery
-
-Version 2 replaces simulated outcomes with actual HTTP delivery to a mock merchant server.
-
-```text
-Webhook Engine
-↓
-HTTP Client
-↓
-Mock Merchant Server
-```
-
-This is where the system starts testing real network behavior, then breaking under failure and fixing the resulting edge cases.
-
----
-
 ## Version 3 — Worker Pool
 
-Version 3 introduces a dispatcher feeding a work queue and multiple workers consuming delivery jobs.
+Introduce a dispatcher feeding a shared work queue and multiple workers consuming delivery jobs.
 
 ```text
 Dispatcher
@@ -593,7 +694,7 @@ Multiple Workers
 
 ## Version 4 — Concurrency
 
-Version 4 focuses on shared state, coordination, and the Rust concurrency primitives needed to make the system safe under load.
+Introduce shared state and coordination primitives.
 
 ```text
 Arc
@@ -606,7 +707,7 @@ Thread Coordination
 
 ## Version 5 — Load Testing
 
-Version 5 focuses on scale and stress testing.
+Stress test the system under increasing delivery volume.
 
 ```text
 100
@@ -619,13 +720,31 @@ Webhook Deliveries
 
 ## Version 6 — Backpressure
 
-Version 6 investigates what happens when delivery is slower than production and how bounded queues force the system to slow down safely.
+Investigate what happens when event production exceeds delivery capacity.
+
+Focus areas:
+
+```text
+Bounded Queues
+Queue Growth
+Flow Control
+Backpressure
+```
 
 ---
 
 ## Version 7 — Async Runtime Investigation
 
-Version 7 evaluates when blocking threads stop being enough and whether an async runtime is actually justified.
+Evaluate when blocking threads stop being sufficient and whether async execution is justified.
+
+Topics:
+
+```text
+Tokio
+Async I/O
+Task Scheduling
+Runtime Tradeoffs
+```
 
 ---
 
@@ -637,11 +756,12 @@ Build a production-inspired webhook delivery engine that explores:
 Outbox Pattern
 Retry Scheduling
 Dead Letter Queues
-Backpressure
 Worker Pools
 Concurrency
+Backpressure
 Async Runtimes
 Reliability Engineering
+Distributed Systems
 ```
 
 while understanding why each architectural component exists before introducing it.
