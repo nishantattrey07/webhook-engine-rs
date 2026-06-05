@@ -24,7 +24,7 @@ Upgrade only what is necessary
 Measure again
 ```
 
-No architecture is added simply because "production systems use it".
+No architecture is added simply because “production systems use it”.
 
 Every upgrade must solve a discovered problem.
 
@@ -34,8 +34,6 @@ Every upgrade must solve a discovered problem.
 
 This project is being used to deeply understand:
 
-- Rust concurrency
-- Worker pools
 - Channels
 - Shared state
 - Backpressure
@@ -74,18 +72,28 @@ Dispatcher
 Worker
 Retry Queue
 Retry Processor
-Retry Count
+Attempt Tracking
 Dead Lettering
 Final Invariant Check
 ```
 
-Retry semantics:
+Current retry semantics:
 
 ```text
-Meaning A: 5 retries after the first attempt
+1 initial attempt
++ 4 retries
+= 5 total attempts
 ```
 
-### Next
+The field used in the code is `attempt_count`, and it means:
+
+```text
+current attempt number
+```
+
+---
+
+## Next
 
 ```text
 Version 2 → Real HTTP Delivery
@@ -312,7 +320,7 @@ Retry Queue
 ↓
 Retry Processor
 ↓
-Max retries exceeded
+Max attempts exceeded
 ↓
 DeadLettered
 
@@ -335,23 +343,33 @@ instead of full event objects.
 
 That keeps the queue lightweight and ensures the in-memory store remains the single source of truth.
 
+The queue is intentionally thread-local because Version 1 is still a single-threaded simulation.
+
 ---
 
-## Retry Count
+## Attempt Tracking
 
 Each event tracks:
 
 ```text
-retry_count
+attempt_count
 ```
 
 which means:
 
 ```text
-number of retries already performed
+current attempt number
 ```
 
-not the total number of delivery attempts.
+not “retries only”.
+
+Example:
+
+```text
+Attempt 1 -> attempt_count = 1
+Attempt 2 -> attempt_count = 2
+Attempt 3 -> attempt_count = 3
+```
 
 ---
 
@@ -360,18 +378,18 @@ not the total number of delivery attempts.
 Version 1 uses:
 
 ```text
-MAX_RETRY = 5
+MAX_ATTEMPT = 5
 ```
 
 Meaning:
 
 ```text
 1 initial attempt
-+
-5 additional retry attempts
++ 4 retries
+= 5 total attempts
 ```
 
-If the event still fails temporarily after those retries, it is dead-lettered.
+If the event still fails temporarily after those attempts, it is dead-lettered.
 
 ---
 
@@ -399,7 +417,7 @@ If delivery fails permanently, the event becomes `DeadLettered`.
 
 ## Retry Processor
 
-The retry processor drains the retry queue and tries the event again using the stored `retry_count`.
+The retry processor drains the retry queue and tries the event again using the stored `attempt_count`.
 
 It updates the real event in the store, not a copied event in the queue.
 

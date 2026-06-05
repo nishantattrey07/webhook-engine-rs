@@ -72,7 +72,7 @@ pub struct Event{
     pub object_id:u64,
     pub merchant_id:u64,
     pub status:EventStatus,
-    pub retry_count:u64
+    pub attempt_count:u64
 }
 
 #[derive(Debug, Clone,PartialEq)]
@@ -155,7 +155,7 @@ impl InMemoryStore {
         event_status:EventStatus)->u64{
 
             let event_id =self.next_event_id;
-            let event:Event= Event { event_id, event_type, object_id, merchant_id, status: event_status,retry_count:0 };
+            let event:Event= Event { event_id, event_type, object_id, merchant_id, status: event_status,attempt_count:0 };
             self.domain_events.insert(event_id, event);
             self.next_event_id+=1;
         

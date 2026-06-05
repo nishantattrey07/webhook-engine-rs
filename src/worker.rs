@@ -5,13 +5,14 @@ use crate::webhook_simulator::simulate_delivery;
 
 pub fn run_worker(event:&mut Event){
         if event.status==EventStatus::Pending{
+            event.attempt_count+=1;
             let outcome = simulate_delivery(
                 event.merchant_id,
-                event.retry_count
+                event.attempt_count
             );
             
             match outcome {
-                DeliveryOutcome::Success =>
+                DeliveryOutcome::Success => 
                    event.mark_event_delivered(),
                 DeliveryOutcome::TemporaryFailure =>{
                     event.mark_event_pending();

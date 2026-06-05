@@ -1,7 +1,7 @@
 use crate::webhook_simulator::simulate_delivery;
 use crate::queue:: RETRY_QUEUE;
 use crate::types::{DeliveryOutcome, InMemoryStore};
-const MAX_RETRY:u64 = 5;
+const MAX_ATTEMPT:u64 = 5;
 
 pub fn retry(db:&mut InMemoryStore){
 
@@ -13,23 +13,23 @@ pub fn retry(db:&mut InMemoryStore){
 
             
             if let Some(original_event) = db.domain_events.get_mut(&event){
+                original_event.attempt_count+=1;
                 let outcome = simulate_delivery
-                    (original_event.merchant_id, original_event.retry_count);
+                    (original_event.merchant_id, original_event.attempt_count);
                 match outcome {
-                    DeliveryOutcome::Success =>{
-                        original_event.retry_count+=1;
-                        original_event.mark_event_delivered();
-                    },
-                    DeliveryOutcome::TemporaryFailure =>{
-                        original_event.retry_count+=1;
-                        if original_event.retry_count>MAX_RETRY{
+                    DeliveryOutcome::Success =>
+                        original_event.mark_event_delivered()
+                    ,
+                    DeliveryOutcome::TemporaryFailure => {
+                        if original_event.attempt_count >= MAX_ATTEMPT {
                             original_event.mark_event_deadlettered();
-                        }else {
-                            RETRY_QUEUE.with(|queue_cell| {
-                                     queue_cell.borrow_mut().push_back(event);
-                            });
+                            continue;
                         }
-                    },
+                    
+                        RETRY_QUEUE.with(|queue_cell| {
+                            queue_cell.borrow_mut().push_back(event);
+                        });
+                    }
                     DeliveryOutcome::PermanentFailure =>
                         original_event.mark_event_deadlettered(),
                 }
