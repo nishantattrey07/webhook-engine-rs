@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
@@ -37,7 +37,7 @@ pub enum EventType{
     PaymentRefund
 }
 
-
+#[derive(Debug, Clone,PartialEq)]
 pub enum DeliveryOutcome {
     Success,
     TemporaryFailure,
@@ -93,11 +93,23 @@ pub struct Event{
 }
 
 #[derive(Debug, Clone,PartialEq)]
+pub struct DeliveryAttempt {
+    pub attempt_id:u64,
+    pub attempt_count:u64,
+    pub event_id:u64,
+    pub http_status: Option<u16>,
+    pub outcome:DeliveryOutcome,
+    pub timestamp:SystemTime,
+}
+
+#[derive(Debug, Clone,PartialEq)]
 pub struct InMemoryStore {
     pub next_payment_id: u64,
     pub next_event_id: u64,
+    pub next_attempt_id:u64,
     pub payments: HashMap<u64, Payment>,
     pub domain_events: HashMap<u64, Event>,
+    pub attempt_history: Vec<DeliveryAttempt>,
 }
 
 impl InMemoryStore {
@@ -105,8 +117,10 @@ impl InMemoryStore {
         InMemoryStore { 
             next_payment_id: 1,
             next_event_id: 101,
+            next_attempt_id:1,
             payments: HashMap::new(),
             domain_events: HashMap::new(),
+            attempt_history: Vec::new(),
         }
     }
 
@@ -240,14 +254,117 @@ impl InMemoryStore {
     }
 
 
-    pub fn verify_invariant(&self){
-        let count:u64 = self.event_deadlettered_count()+self.event_delivered_count();
-        if count == self.domain_events.len() as u64{
+    pub fn verify_invariant(&self) {
+        println!("\n=== INVARIANT REPORT ===");
+    
+        // -------------------------
+        // Invariant 1
+        // Delivered + DeadLettered == Total Events
+        // -------------------------
+    
+        let delivered = self.event_delivered_count();
+        let deadlettered = self.event_deadlettered_count();
+        let total_events = self.domain_events.len() as u64;
+    
+        println!("\n[Lifecycle Invariant]");
+    
+        println!("Delivered Events    : {}", delivered);
+        println!("DeadLettered Events : {}", deadlettered);
+        println!("Total Events        : {}", total_events);
+    
+        if delivered + deadlettered == total_events {
             println!("PASS");
-        }else{
-           println!("FAIL"); 
+        } else {
+            println!("FAIL");
         }
-        
+    
+        // -------------------------
+        // Invariant 2
+        // PermanentFailure must be terminal
+        // -------------------------
+    
+        println!("\n[PermanentFailure Terminal Invariant]");
+    
+        let mut violations = 0;
+    
+        for (index, attempt) in self.attempt_history.iter().enumerate() {
+            if attempt.outcome == DeliveryOutcome::PermanentFailure {
+    
+                for later_attempt in self.attempt_history.iter().skip(index + 1) {
+    
+                    if later_attempt.event_id == attempt.event_id {
+                        violations += 1;
+    
+                        println!(
+                            "FAIL: Event {} had another attempt after PermanentFailure",
+                            attempt.event_id
+                        );
+    
+                        break;
+                    }
+                }
+            }
+        }
+    
+        println!(
+            "Events Checked : {}",
+            self.attempt_history.len()
+        );
+    
+        println!(
+            "Violations     : {}",
+            violations
+        );
+    
+        if violations == 0 {
+            println!("PASS");
+        }
+    
+        // -------------------------
+        // Invariant 3
+        // Event.attempt_count matches history
+        // -------------------------
+    
+        println!("\n[Attempt Count Consistency Invariant]");
+    
+        let mut count_violations = 0;
+    
+        for event in self.domain_events.values() {
+    
+            let history_count = self
+                .attempt_history
+                .iter()
+                .filter(|attempt| attempt.event_id == event.event_id)
+                .count() as u64;
+    
+            if history_count != event.attempt_count {
+    
+                count_violations += 1;
+    
+                println!(
+                    "FAIL: Event {} -> event.attempt_count={} history_count={}",
+                    event.event_id,
+                    event.attempt_count,
+                    history_count
+                );
+            }
+        }
+    
+        println!(
+            "Events Checked : {}",
+            self.domain_events.len()
+        );
+    
+        println!(
+            "Violations     : {}",
+            count_violations
+        );
+    
+        if count_violations == 0 {
+            println!("PASS");
+        }
+    
+        println!("\n=== END REPORT ===");
     }
 
 

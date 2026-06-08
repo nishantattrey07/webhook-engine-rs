@@ -1,18 +1,17 @@
 use crate::types::{DeliveryOutcome, WebhookPayload};
 use ureq::Agent;
 
-// tech deb- implement DeliveryError enum
+// tech debt - implement DeliveryError enum
 // enum DeliveryError {
 //     Timeout,
 //     ConnectionRefused,
 //     DnsFailure,
 // }
 
-
 pub fn send_webhook(
     merchant_id: u64,
     payload: WebhookPayload,
-) -> DeliveryOutcome {
+) -> (DeliveryOutcome, Option<u16>) {
     let url = format!(
         "http://0.0.0.0:3000/webhook/{}",
         merchant_id
@@ -37,7 +36,10 @@ pub fn send_webhook(
                 merchant_id
             );
 
-            return DeliveryOutcome::Timeout;
+            return (
+                DeliveryOutcome::Timeout,
+                None,
+            );
         }
 
         Err(err) => {
@@ -47,11 +49,14 @@ pub fn send_webhook(
                 err
             );
 
-            return DeliveryOutcome::TemporaryFailure;
+            return (
+                DeliveryOutcome::TemporaryFailure,
+                None,
+            );
         }
     };
 
-    let status_code = response.status().as_u16();
+    let http_status = response.status().as_u16();
 
     println!(
         "Merchant-id: {}      status-code: {}",
@@ -59,15 +64,30 @@ pub fn send_webhook(
         response.status()
     );
 
-    match status_code {
-        200..=299 => DeliveryOutcome::Success,
+    match http_status {
+        200..=299 => (
+            DeliveryOutcome::Success,
+            Some(http_status),
+        ),
 
-        429 => DeliveryOutcome::TemporaryFailure,
+        429 => (
+            DeliveryOutcome::TemporaryFailure,
+            Some(http_status),
+        ),
 
-        500..=599 => DeliveryOutcome::TemporaryFailure,
+        500..=599 => (
+            DeliveryOutcome::TemporaryFailure,
+            Some(http_status),
+        ),
 
-        400..=499 => DeliveryOutcome::PermanentFailure,
+        400..=499 => (
+            DeliveryOutcome::PermanentFailure,
+            Some(http_status),
+        ),
 
-        _ => DeliveryOutcome::TemporaryFailure,
+        _ => (
+            DeliveryOutcome::TemporaryFailure,
+            Some(http_status),
+        ),
     }
 }

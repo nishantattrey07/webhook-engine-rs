@@ -1,66 +1,119 @@
-use crate::types::{DeliveryOutcome, EventStatus, InMemoryStore, WebhookPayload, WebhookPayloadData};
+use crate::types::{DeliveryOutcome, EventStatus, InMemoryStore, WebhookPayload, WebhookPayloadData,DeliveryAttempt};
 use crate::queue::RETRY_QUEUE;
 use crate::webhook_simulator::{send_webhook};
+use std::time::SystemTime;
 const MAX_ATTEMPT:u64 = 5;
- 
-pub fn run_worker(db:&mut InMemoryStore,event_id:u64){
 
-   if let Some(event) = db.domain_events.get_mut(&event_id){
-       if event.status==EventStatus::Pending{
 
-           // getting payment data
-           let payment_id=event.object_id;
-           let payment_data = db.payments.get(&payment_id).unwrap();
-           let payload:WebhookPayload = 
-               WebhookPayload { 
-                    event_id,
-                    event_type: event.event_type.clone(),
-                    data: WebhookPayloadData {
-                        payment_id,
-                        order_id: payment_data.order_id,
-                        mode_of_payment: payment_data.mode_of_payment.clone(),
-                        amount: payment_data.amount,
-                        status: payment_data.status.clone()
-                    } 
-           };
+pub fn run_worker(db: &mut InMemoryStore, event_id: u64) {
+    
+    // Read current event state
+    let (
+        merchant_id,
+        payment_id,
+        event_type,
+    ) = {
+        let event = match db.domain_events.get(&event_id) {
+            Some(event) => event,
+            None => return,
+        };
+    
+        if event.status != EventStatus::Pending {
+            return;
+        }
+    
+        (
+            event.merchant_id,
+            event.object_id,
+            event.event_type.clone(),
+        )
+    };
 
-           
-           event.attempt_count+=1;
-           let result = send_webhook(
-               event.merchant_id,
-               payload
-           );
 
+    // Build payload
+    let payment_data = match db.payments.get(&payment_id) {
+        Some(payment) => payment,
+        None => return,
+    };
+
+    
+
+    let payload = WebhookPayload {
+        event_id,
+        event_type,
+        data: WebhookPayloadData {
+            payment_id,
+            order_id: payment_data.order_id,
+            mode_of_payment: payment_data.mode_of_payment.clone(),
+            amount: payment_data.amount,
+            status: payment_data.status.clone(),
+        },
+    };
+
+    let attempt_count = {
+        let event = match db.domain_events.get_mut(&event_id) {
+            Some(event) => event,
+            None => return,
+        };
+    
+        event.attempt_count += 1;
+        event.attempt_count
+    };
+    
+    // Record attempt start time
+    let timestamp = SystemTime::now();
+
+    
+    let (outcome, http_status) =
+        send_webhook(merchant_id, payload);
+
+    
+
+    
+    // Store attempt history
+    
+    let attempt_id = db.next_attempt_id;
+
+    db.next_attempt_id += 1;
+
+    db.attempt_history.push(DeliveryAttempt {
+        attempt_id,
+        event_id,
+        http_status,
+        outcome: outcome.clone(),
+        timestamp,
+        attempt_count,
+    });
+
+    
+    // Update event state
+    let event = match db.domain_events.get_mut(&event_id) {
+        Some(event) => event,
+        None => return,
+    };
+
+    match outcome {
+        DeliveryOutcome::Success => {
+            event.mark_event_delivered();
+        }
+
+        DeliveryOutcome::TemporaryFailure
+        | DeliveryOutcome::Timeout => {
+            if attempt_count >= MAX_ATTEMPT {
+                event.mark_event_deadlettered();
+            } else {
+                event.mark_event_pending();
+
+                RETRY_QUEUE.with(|queue_cell| {
+                    queue_cell
+                        .borrow_mut()
+                        .push_back(event.event_id);
+                });
+            }
+        }
+
+        DeliveryOutcome::PermanentFailure => 
+            event.mark_event_deadlettered()
         
-
-           match result {
-               DeliveryOutcome::Success => 
-                  event.mark_event_delivered(),
-               DeliveryOutcome::TemporaryFailure |
-               DeliveryOutcome::Timeout =>{
-
-                   if event.attempt_count >= MAX_ATTEMPT {
-                       event.mark_event_deadlettered();
-                   }
-                   else{
-                       event.mark_event_pending();
-                       // i am still not good with this line section
-                       // help me understand it properly
-                       RETRY_QUEUE.with(|queue_cell|{
-                           let mut queue = queue_cell.borrow_mut();
-                           queue.push_back(event.event_id.clone());
-                       })
-                   }
-                   
-               },
-               DeliveryOutcome::PermanentFailure =>
-                   event.mark_event_deadlettered(),
-           }
-           
-           };
-
-           
-           
-       }
-   }
-        
+    }
+}
