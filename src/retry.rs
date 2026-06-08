@@ -5,13 +5,12 @@ use crate::worker::run_worker;
 
 pub fn retry(db:&mut InMemoryStore){
 
-    while let Some(event) =
+    while let Some(event_id) =
         RETRY_QUEUE.with(
             |queue_cell|
                 queue_cell.borrow_mut().pop_front()
-        ){
-            if let Some(original_event) = db.domain_events.get(&event){
-                run_worker(db,original_event.event_id);
-            };   
+        )
+    {
+        run_worker(db, event_id);
     }
 }

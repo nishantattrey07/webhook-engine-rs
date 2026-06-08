@@ -1,56 +1,21 @@
 use webhook_engine::types::InMemoryStore;
 use webhook_engine::payment_service::add_payments_db;
-use webhook_engine::dispatcher:: run_dispatcher;
+use webhook_engine::dispatcher::run_dispatcher;
 use webhook_engine::retry::retry;
+use webhook_engine::report::print_engine_report;
+use std::time::Instant;
 
+fn main() {
+    let start = Instant::now();
 
-
-
-
-
-
-
-
-fn main(){
     let mut store = InMemoryStore::new();
 
     add_payments_db(&mut store);
 
-    println!("*************************************");
-    println!("Before Simulation");
-    println!(" ");
-    println!("Delivered Events: {:#?}",store.event_delivered_count());
-    println!("Pending Events: {:#?}",store.event_pending_count());
-    println!("DeadLettered Events: {:#?}",store.event_deadlettered_count());
-    println!(" ");
+    run_dispatcher(&mut store);
+    retry(&mut store);
 
-    
-      run_dispatcher(&mut store);
-   
-    
-    println!("*************************************");
-    println!("After Simulation");
-    println!(" ");
-    println!("Delivered Events: {:#?}",store.event_delivered_count());
-    println!("Pending Events: {:#?}",store.event_pending_count());
-    println!("DeadLettered Events: {:#?}",store.event_deadlettered_count());
-    println!(" ");
+    let elapsed = start.elapsed();
 
-    println!("*************************************");
-    println!("After retry");
-    println!(" ");
-        retry(&mut store);
-    
-    println!("Delivered Events: {:#?}",store.event_delivered_count());
-    println!("Pending Events: {:#?}",store.event_pending_count());
-    println!("DeadLettered Events: {:#?}",store.event_deadlettered_count());
-    println!(" ");
-
-    println!("*************************************");
-    println!("Result");
-    store.verify_invariant();
-    println!(" ");
-
-
-    
+    print_engine_report(&store, elapsed);
 }

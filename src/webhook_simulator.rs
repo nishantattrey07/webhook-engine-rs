@@ -59,8 +59,9 @@ pub fn send_webhook(
     let http_status = response.status().as_u16();
 
     println!(
-        "Merchant-id: {}      status-code: {}",
+        "Merchant-id: {}   Event-id:{}   status-code: {}",
         merchant_id,
+        payload.event_id,
         response.status()
     );
 

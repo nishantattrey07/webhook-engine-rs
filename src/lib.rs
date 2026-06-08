@@ -6,3 +6,4 @@ pub mod worker;
 pub mod queue;
 pub mod retry;
 pub mod webhook_simulator;
+pub mod report;

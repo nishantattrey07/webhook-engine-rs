@@ -89,7 +89,11 @@ pub struct Event{
     pub object_id:u64,
     pub merchant_id:u64,
     pub status:EventStatus,
-    pub attempt_count:u64
+    pub attempt_count:u64,
+
+    pub created_at: Instant,
+    pub first_attempt_at: Option<Instant>,
+    pub final_state_at: Option<Instant>,
 }
 
 #[derive(Debug, Clone,PartialEq)]
@@ -99,6 +103,10 @@ pub struct DeliveryAttempt {
     pub event_id:u64,
     pub http_status: Option<u16>,
     pub outcome:DeliveryOutcome,
+
+    pub started_at: Instant,
+    pub completed_at: Instant,
+
     pub timestamp:SystemTime,
 }
 
@@ -110,6 +118,19 @@ pub struct InMemoryStore {
     pub payments: HashMap<u64, Payment>,
     pub domain_events: HashMap<u64, Event>,
     pub attempt_history: Vec<DeliveryAttempt>,
+}
+
+#[derive(Debug)]
+pub struct InvariantReport {
+    pub lifecycle_passed: bool,
+    pub permanent_failure_passed: bool,
+    pub attempt_consistency_passed: bool,
+
+    pub lifecycle_lhs: u64,
+    pub lifecycle_rhs: u64,
+
+    pub permanent_failure_violations: u64,
+    pub attempt_count_violations: u64,
 }
 
 impl InMemoryStore {
@@ -186,7 +207,18 @@ impl InMemoryStore {
         event_status:EventStatus)->u64{
 
             let event_id =self.next_event_id;
-            let event:Event= Event { event_id, event_type, object_id, merchant_id, status: event_status,attempt_count:0 };
+            let event:Event= Event {
+                event_id,
+                event_type,
+                object_id,
+                merchant_id,
+                status: event_status,
+                attempt_count:0,
+            
+                created_at: Instant::now(),
+                first_attempt_at: None,
+                final_state_at: None,
+            };
             self.domain_events.insert(event_id, event);
             self.next_event_id+=1;
         
@@ -219,115 +251,65 @@ impl InMemoryStore {
     }
 
 
-    pub fn process_pending_events(&mut self){
-        for i in self.domain_events.iter_mut().map(|(_,d)| d).filter(|v| v.status==EventStatus::Pending){
-            i.status=EventStatus::Delivered
-        }
-    }
 
 
     pub fn event_pending_count(&self)->u64{
-        let mut count = 0;
-        for _ in self.domain_events.iter().map(|(_,d)| d).filter(|v| v.status==EventStatus::Pending){
-            count+=1;
-        }
-
-        count
+        
+        self.domain_events.values()
+            .filter(|v| v.status==EventStatus::Pending)
+            .count() as u64   
     }
 
-    pub fn event_delivered_count(&self)->u64{
-        let mut count = 0;
-        for _ in self.domain_events.iter().map(|(_,d)| d).filter(|v| v.status==EventStatus::Delivered){
-            count+=1;
-        }
-
-        count
+    pub fn event_delivered_count(&self) -> u64 {
+        self.domain_events.values()
+            .filter(|e| e.status == EventStatus::Delivered)
+            .count() as u64
     }
 
     pub fn event_deadlettered_count(&self)->u64{
-        let mut count = 0;
-        for _ in self.domain_events.iter().map(|(_,d)| d).filter(|v| v.status==EventStatus::DeadLettered){
-            count+=1;
-        }
-
-        count
+        
+        self.domain_events.values()
+            .filter(|v| v.status==EventStatus::DeadLettered)
+            .count() as u64    
     }
 
-
-    pub fn verify_invariant(&self) {
-        println!("\n=== INVARIANT REPORT ===");
+    pub fn verify_invariant(&self) -> InvariantReport {
     
-        // -------------------------
         // Invariant 1
-        // Delivered + DeadLettered == Total Events
-        // -------------------------
-    
         let delivered = self.event_delivered_count();
         let deadlettered = self.event_deadlettered_count();
         let total_events = self.domain_events.len() as u64;
     
-        println!("\n[Lifecycle Invariant]");
+        let lifecycle_lhs = delivered + deadlettered;
+        let lifecycle_rhs = total_events;
     
-        println!("Delivered Events    : {}", delivered);
-        println!("DeadLettered Events : {}", deadlettered);
-        println!("Total Events        : {}", total_events);
+        let lifecycle_passed =
+            lifecycle_lhs == lifecycle_rhs;
     
-        if delivered + deadlettered == total_events {
-            println!("PASS");
-        } else {
-            println!("FAIL");
-        }
-    
-        // -------------------------
         // Invariant 2
-        // PermanentFailure must be terminal
-        // -------------------------
     
-        println!("\n[PermanentFailure Terminal Invariant]");
-    
-        let mut violations = 0;
+        let mut permanent_failure_violations = 0;
     
         for (index, attempt) in self.attempt_history.iter().enumerate() {
+    
             if attempt.outcome == DeliveryOutcome::PermanentFailure {
     
                 for later_attempt in self.attempt_history.iter().skip(index + 1) {
     
                     if later_attempt.event_id == attempt.event_id {
-                        violations += 1;
-    
-                        println!(
-                            "FAIL: Event {} had another attempt after PermanentFailure",
-                            attempt.event_id
-                        );
-    
+                        permanent_failure_violations += 1;
                         break;
                     }
                 }
             }
         }
     
-        println!(
-            "Events Checked : {}",
-            self.attempt_history.len()
-        );
+        let permanent_failure_passed =
+            permanent_failure_violations == 0;
     
-        println!(
-            "Violations     : {}",
-            violations
-        );
-    
-        if violations == 0 {
-            println!("PASS");
-        }
-    
-        // -------------------------
         // Invariant 3
-        // Event.attempt_count matches history
-        // -------------------------
     
-        println!("\n[Attempt Count Consistency Invariant]");
-    
-        let mut count_violations = 0;
+        let mut attempt_count_violations = 0;
     
         for event in self.domain_events.values() {
     
@@ -338,35 +320,25 @@ impl InMemoryStore {
                 .count() as u64;
     
             if history_count != event.attempt_count {
-    
-                count_violations += 1;
-    
-                println!(
-                    "FAIL: Event {} -> event.attempt_count={} history_count={}",
-                    event.event_id,
-                    event.attempt_count,
-                    history_count
-                );
+                attempt_count_violations += 1;
             }
         }
     
-        println!(
-            "Events Checked : {}",
-            self.domain_events.len()
-        );
+        let attempt_consistency_passed =
+            attempt_count_violations == 0;
     
-        println!(
-            "Violations     : {}",
-            count_violations
-        );
+        InvariantReport {
+            lifecycle_passed,
+            permanent_failure_passed,
+            attempt_consistency_passed,
     
-        if count_violations == 0 {
-            println!("PASS");
+            lifecycle_lhs,
+            lifecycle_rhs,
+    
+            permanent_failure_violations,
+            attempt_count_violations,
         }
-    
-        println!("\n=== END REPORT ===");
     }
-
 
     
 }
@@ -384,5 +356,14 @@ impl Event {
     pub fn mark_event_deadlettered(&mut self){
             self.status=EventStatus::DeadLettered
         
+    }
+}
+
+
+impl InvariantReport {
+    pub fn all_passed(&self) -> bool {
+        self.lifecycle_passed
+            && self.permanent_failure_passed
+            && self.attempt_consistency_passed
     }
 }
