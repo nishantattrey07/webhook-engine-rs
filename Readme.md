@@ -104,6 +104,11 @@ Retryable Failures
 Permanent Failures
 Dead Letter Handling
 Invariant Validation
+Attempt History
+Timestamp Tracking
+Latency Measurement
+Engine Reporting
+Invariant Reporting
 ```
 
 Delivery classification:
@@ -395,6 +400,7 @@ Delivered + DeadLettered == Total Events
 
 ---
 
+
 # Version 2
 
 Version 2 replaces simulated delivery with real HTTP communication.
@@ -402,6 +408,8 @@ Version 2 replaces simulated delivery with real HTTP communication.
 The objective is to validate delivery behavior against real network conditions before introducing concurrency.
 
 Version 2 intentionally remains single-threaded.
+
+Version 2 focuses on correctness first and observability second before introducing concurrency.
 
 ---
 
@@ -549,15 +557,159 @@ This acts as a simple in-memory Dead Letter Queue.
 
 ---
 
-## Final Invariant
+## Delivery Attempt History
 
-Version 2 validates:
+Every delivery attempt is persisted in memory.
+
+Each attempt records:
+
+```text
+attempt_id
+event_id
+attempt_count
+http_status
+outcome
+started_at
+completed_at
+```
+
+This creates a complete audit trail of delivery behavior.
+
+The history is used for:
+
+```text
+Invariant validation
+Latency reporting
+Debugging
+Performance analysis
+```
+
+---
+
+## Timestamp Tracking
+
+Version 2 introduces lifecycle timestamps.
+
+### Event
+
+```text
+created_at
+first_attempt_at
+final_state_at
+```
+
+### DeliveryAttempt
+
+```text
+started_at
+completed_at
+```
+
+These timestamps are stored in the data model rather than logs.
+
+This allows the engine to compute performance metrics directly from internal state.
+
+---
+
+## Latency Metrics
+
+Version 2 measures two latency categories.
+
+### End-to-End Event Latency
+
+```text
+final_state_at - created_at
+```
+
+Measures how long an event takes to reach a terminal state.
+
+This includes:
+
+```text
+HTTP Calls
+Retries
+Timeouts
+Dead Lettering
+```
+
+### HTTP Call Duration
+
+```text
+completed_at - started_at
+```
+
+Measures network and merchant response time only.
+
+This excludes retry behavior and focuses purely on a single delivery attempt.
+
+---
+
+## Percentile Reporting
+
+Latency is reported using:
+
+```text
+min
+p50
+p95
+p99
+max
+```
+
+Percentiles expose tail latency and provide a more realistic picture of delivery performance than averages alone.
+
+Averages can hide slow outliers, while percentiles show the actual experience of the slowest deliveries.
+
+---
+
+## Engine Report
+
+At the end of every run the engine generates a report derived entirely from store state.
+
+The report contains:
+
+```text
+Configuration
+Throughput
+Outcome Counts
+End-to-End Event Latency
+HTTP Call Duration
+Invariant Results
+```
+
+The report is generated from the in-memory store and does not parse logs.
+
+The store remains the source of truth.
+
+---
+
+## Invariant Validation
+
+Version 2 validates three correctness invariants.
+
+### Invariant 1
 
 ```text
 Delivered + DeadLettered == Total Events
 ```
 
-ensuring no event disappears from the delivery lifecycle.
+Ensures no event disappears from the delivery lifecycle.
+
+### Invariant 2
+
+```text
+PermanentFailure is terminal
+```
+
+No delivery attempt may occur after a permanent failure.
+
+### Invariant 3
+
+```text
+Event.attempt_count == AttemptHistory Count
+```
+
+Attempt summaries must match recorded delivery history.
 
 ---
 
@@ -588,6 +740,30 @@ DeadLettered
 ```
 
 No intermediate states currently exist.
+
+### Immediate Retries
+
+Retries happen immediately.
+
+There is currently:
+
+```text
+No Delay
+No Backoff
+No Jitter
+```
+
+### No Worker Pool
+
+Only a single worker executes delivery attempts.
+
+One slow merchant can stall the entire engine.
+
+### No Persistence
+
+Payments, events, and delivery history exist only in memory.
+
+A process restart loses all state.
 
 ---
 
