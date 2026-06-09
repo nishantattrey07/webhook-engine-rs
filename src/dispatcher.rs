@@ -1,16 +1,16 @@
 use crate::types::{InMemoryStore};
-use crate::worker::run_worker;
+use std::sync::{Arc,Mutex};
+use crate::queue::enqueue;
 
 
 
-// it will check for pending events after the events are stored in
-// event store
-pub fn run_dispatcher(db:&mut InMemoryStore)->bool{
-    let collection = db.pending_events();
+pub fn run_dispatcher(db:Arc<Mutex<InMemoryStore>>)->bool{
+    
+    let collection = db.clone().lock().unwrap().pending_events();
 
-    for event in collection{
-        run_worker(db,event);
+    for event_id in collection {
+            enqueue(event_id);
     }
-
+    
     true
 }
