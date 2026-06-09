@@ -6,13 +6,17 @@ const MAX_ATTEMPT:u64 = 5;
 
 
 pub fn run_worker(db:Db, event_id: u64) {
-    let mut store = db.lock().unwrap();
+
+    println!("worker start {}", event_id);
+    
     // Read current event state
     let (
         merchant_id,
         payment_id,
         event_type,
     ) = {
+
+        let store = db.lock().unwrap();
         let event = match store.domain_events.get(&event_id) {
             Some(event) => event,
             None => return,
@@ -31,9 +35,26 @@ pub fn run_worker(db:Db, event_id: u64) {
 
 
     // Build payload
-    let payment_data = match store.payments.get(&payment_id) {
-        Some(payment) => payment,
-        None => return,
+    let (
+        order_id,
+        mode_of_payment,
+        amount,
+        status,
+    ) = {
+        let store = db.lock().unwrap();
+    
+        let payment = match
+            store.payments.get(&payment_id){
+                Some(payment) => payment,
+                None => return,
+            };
+    
+        (
+            payment.order_id,
+            payment.mode_of_payment.clone(),
+            payment.amount,
+            payment.status.clone(),
+        )
     };
 
     
@@ -43,14 +64,15 @@ pub fn run_worker(db:Db, event_id: u64) {
         event_type,
         data: WebhookPayloadData {
             payment_id,
-            order_id: payment_data.order_id,
-            mode_of_payment: payment_data.mode_of_payment.clone(),
-            amount: payment_data.amount,
-            status: payment_data.status.clone(),
+            order_id,
+            mode_of_payment,
+            amount,
+            status,
         },
     };
 
     let attempt_count = {
+        let mut store = db.lock().unwrap();
         let event = match store.domain_events.get_mut(&event_id) {
             Some(event) => event,
             None => return,
@@ -77,53 +99,64 @@ pub fn run_worker(db:Db, event_id: u64) {
 
     
     // Store attempt history
+    {
+        let mut store = db.lock().unwrap();
+        let attempt_id = store.next_attempt_id;
     
-    let attempt_id = db.lock().unwrap().next_attempt_id;
-
-    db.lock().unwrap().next_attempt_id += 1;
-
-    db.lock().unwrap().attempt_history.push(DeliveryAttempt {
-        attempt_id,
-        event_id,
-        http_status,
-        outcome: outcome.clone(),
+        store.next_attempt_id += 1;
     
-        started_at,
-        completed_at,
+        store.attempt_history.push(DeliveryAttempt {
+            attempt_id,
+            event_id,
+            http_status,
+            outcome: outcome.clone(),
+        
+            started_at,
+            completed_at,
+        
+            timestamp,
+            attempt_count,
+        });
+    }
     
-        timestamp,
-        attempt_count,
-    });
 
     
     // Update event state
-    let event = match store.domain_events.get_mut(&event_id) {
-        Some(event) => event,
-        None => return,
-    };
+    
 
     
-    match outcome {
-        DeliveryOutcome::Success => {
-            event.mark_event_delivered();
-            event.final_state_at = Some(completed_at);
-        }
+    {
+        let mut store = db.lock().unwrap();
     
-        DeliveryOutcome::TemporaryFailure
-        | DeliveryOutcome::Timeout => {
-            if attempt_count >= MAX_ATTEMPT {
+        let event = match store.domain_events.get_mut(&event_id) {
+            Some(event) => event,
+            None => return,
+        };
+    
+        match outcome {
+            DeliveryOutcome::Success => {
+                event.mark_event_delivered();
+                event.final_state_at = Some(completed_at);
+            }
+    
+            DeliveryOutcome::TemporaryFailure
+            | DeliveryOutcome::Timeout => {
+                if attempt_count >= MAX_ATTEMPT {
+                    event.mark_event_deadlettered();
+                    event.final_state_at = Some(completed_at);
+                } else {
+                    event.mark_event_pending();
+                    println!("retry {}", event_id);
+                    enqueue(event_id);
+                }
+            }
+    
+            DeliveryOutcome::PermanentFailure => {
                 event.mark_event_deadlettered();
                 event.final_state_at = Some(completed_at);
-            } else {
-                event.mark_event_pending();
-    
-                enqueue(event_id);
             }
         }
-    
-        DeliveryOutcome::PermanentFailure => {
-            event.mark_event_deadlettered();
-            event.final_state_at = Some(completed_at);
-        }
     }
+
+    println!("worker end {}", event_id);
 }

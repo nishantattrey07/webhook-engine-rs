@@ -22,6 +22,7 @@ Identify the bottleneck
 Upgrade only what is necessary
 ↓
 Measure again
+
 ```
 
 No architecture is added simply because "production systems use it".
@@ -63,6 +64,7 @@ Delivery Simulation
 Event State Transitions
 Metrics
 Invariant Validation
+
 ```
 
 ---
@@ -79,6 +81,7 @@ Retry Processor
 Attempt Tracking
 Dead Lettering
 Final Invariant Check
+
 ```
 
 Retry semantics:
@@ -87,6 +90,7 @@ Retry semantics:
 1 initial attempt
 + 4 retries
 = 5 total attempts
+
 ```
 
 ---
@@ -109,20 +113,35 @@ Timestamp Tracking
 Latency Measurement
 Engine Reporting
 Invariant Reporting
+
 ```
 
 Delivery classification:
 
 ```text
 2xx                     -> Success
-
 429                     -> TemporaryFailure
-
 5xx                     -> TemporaryFailure
-
 4xx                     -> PermanentFailure
-
 Client Timeout          -> Timeout
+
+```
+
+---
+
+### Version 3 — Worker Pool & Concurrency ✅
+
+Implemented:
+
+```text
+Shared Work Queue
+Global LazyLock State
+Worker Pool (4 Threads)
+Arc<Mutex<T>> State Sharing
+Fine-grained Lock Scoping
+Main Thread Polling/Coordination
+Concurrent HTTP Delivery
+
 ```
 
 ---
@@ -130,11 +149,11 @@ Client Timeout          -> Timeout
 ## Next
 
 ```text
-Version 3 → Worker Pool
-Version 4 → Concurrency & Channels
+Version 4 → Concurrency & Channels (Replacing Mutex with Message Passing)
 Version 5 → Load Testing
 Version 6 → Backpressure
 Version 7 → Async Runtime Investigation
+
 ```
 
 ---
@@ -157,6 +176,7 @@ Domain Event
 Pending
 ↓
 Delivered / DeadLettered
+
 ```
 
 ---
@@ -170,6 +190,7 @@ Stored entities:
 ```text
 Payments
 Domain Events
+
 ```
 
 ---
@@ -181,6 +202,7 @@ Database-generated IDs are simulated using:
 ```text
 next_payment_id
 next_event_id
+
 ```
 
 ---
@@ -191,6 +213,7 @@ A single operation:
 
 ```text
 create_payment_and_event()
+
 ```
 
 creates:
@@ -199,6 +222,7 @@ creates:
 Payment
 +
 Domain Event
+
 ```
 
 together.
@@ -208,6 +232,7 @@ Business invariant:
 ```text
 Every successfully created payment
 must have exactly one corresponding event.
+
 ```
 
 ---
@@ -218,6 +243,7 @@ must have exactly one corresponding event.
 Pending
 Delivered
 DeadLettered
+
 ```
 
 ---
@@ -228,6 +254,7 @@ Version 0 intentionally avoided networking.
 
 ```rust
 simulate_delivery(...)
+
 ```
 
 returned deterministic outcomes:
@@ -236,6 +263,7 @@ returned deterministic outcomes:
 Success
 TemporaryFailure
 PermanentFailure
+
 ```
 
 ---
@@ -246,6 +274,7 @@ PermanentFailure
 Pending Events
 Delivered Events
 DeadLettered Events
+
 ```
 
 ---
@@ -256,6 +285,7 @@ Version 0 validates:
 
 ```text
 payments.len() == domain_events.len()
+
 ```
 
 ---
@@ -304,6 +334,7 @@ DeadLettered
 PermanentFailure
 ↓
 DeadLettered
+
 ```
 
 ---
@@ -314,6 +345,7 @@ The retry queue stores:
 
 ```text
 event_id
+
 ```
 
 instead of full event objects.
@@ -324,6 +356,7 @@ Current implementation:
 
 ```rust
 VecDeque<u64>
+
 ```
 
 ---
@@ -334,12 +367,14 @@ Each event tracks:
 
 ```text
 attempt_count
+
 ```
 
 Meaning:
 
 ```text
 current attempt number
+
 ```
 
 Example:
@@ -348,6 +383,7 @@ Example:
 Attempt 1 -> attempt_count = 1
 Attempt 2 -> attempt_count = 2
 Attempt 3 -> attempt_count = 3
+
 ```
 
 ---
@@ -356,6 +392,7 @@ Attempt 3 -> attempt_count = 3
 
 ```text
 MAX_ATTEMPT = 5
+
 ```
 
 Meaning:
@@ -364,6 +401,7 @@ Meaning:
 1 initial attempt
 + 4 retries
 = 5 total attempts
+
 ```
 
 ---
@@ -386,6 +424,7 @@ Possible outcomes:
 Success
 TemporaryFailure
 PermanentFailure
+
 ```
 
 ---
@@ -396,10 +435,10 @@ Version 1 validates:
 
 ```text
 Delivered + DeadLettered == Total Events
+
 ```
 
 ---
-
 
 # Version 2
 
@@ -429,6 +468,7 @@ Worker
 HTTP POST
 ↓
 Mock Merchant Server
+
 ```
 
 ---
@@ -439,18 +479,21 @@ Version 2 removes:
 
 ```rust
 simulate_delivery(...)
+
 ```
 
 and replaces it with:
 
 ```rust
 send_webhook(...)
+
 ```
 
 using:
 
 ```text
 ureq
+
 ```
 
 as a blocking HTTP client.
@@ -472,6 +515,7 @@ order_id
 amount
 payment_status
 payment_method
+
 ```
 
 This separates internal storage concerns from external API contracts.
@@ -486,14 +530,11 @@ Current rules:
 
 ```text
 2xx                     -> Success
-
 429                     -> TemporaryFailure
-
 5xx                     -> TemporaryFailure
-
 4xx                     -> PermanentFailure
-
 Client Timeout          -> Timeout
+
 ```
 
 This is the first version where the engine becomes network-aware.
@@ -516,6 +557,7 @@ Merchant Responds Too Slowly
 Client Deadline Exceeded
 ↓
 Timeout
+
 ```
 
 ---
@@ -527,12 +569,14 @@ Retryable outcomes:
 ```text
 TemporaryFailure
 Timeout
+
 ```
 
 Non-retryable outcomes:
 
 ```text
 PermanentFailure
+
 ```
 
 ---
@@ -543,12 +587,14 @@ Events become dead-lettered when:
 
 ```text
 PermanentFailure
+
 ```
 
 or
 
 ```text
 Maximum Attempts Exceeded
+
 ```
 
 Dead-lettered events remain visible in the event store.
@@ -571,6 +617,7 @@ http_status
 outcome
 started_at
 completed_at
+
 ```
 
 This creates a complete audit trail of delivery behavior.
@@ -582,6 +629,7 @@ Invariant validation
 Latency reporting
 Debugging
 Performance analysis
+
 ```
 
 ---
@@ -596,6 +644,7 @@ Version 2 introduces lifecycle timestamps.
 created_at
 first_attempt_at
 final_state_at
+
 ```
 
 ### DeliveryAttempt
@@ -603,6 +652,7 @@ final_state_at
 ```text
 started_at
 completed_at
+
 ```
 
 These timestamps are stored in the data model rather than logs.
@@ -619,6 +669,7 @@ Version 2 measures two latency categories.
 
 ```text
 final_state_at - created_at
+
 ```
 
 Measures how long an event takes to reach a terminal state.
@@ -630,12 +681,14 @@ HTTP Calls
 Retries
 Timeouts
 Dead Lettering
+
 ```
 
 ### HTTP Call Duration
 
 ```text
 completed_at - started_at
+
 ```
 
 Measures network and merchant response time only.
@@ -654,6 +707,7 @@ p50
 p95
 p99
 max
+
 ```
 
 Percentiles expose tail latency and provide a more realistic picture of delivery performance than averages alone.
@@ -675,6 +729,7 @@ Outcome Counts
 End-to-End Event Latency
 HTTP Call Duration
 Invariant Results
+
 ```
 
 The report is generated from the in-memory store and does not parse logs.
@@ -691,6 +746,7 @@ Version 2 validates three correctness invariants.
 
 ```text
 Delivered + DeadLettered == Total Events
+
 ```
 
 Ensures no event disappears from the delivery lifecycle.
@@ -699,6 +755,7 @@ Ensures no event disappears from the delivery lifecycle.
 
 ```text
 PermanentFailure is terminal
+
 ```
 
 No delivery attempt may occur after a permanent failure.
@@ -707,87 +764,159 @@ No delivery attempt may occur after a permanent failure.
 
 ```text
 Event.attempt_count == AttemptHistory Count
+
 ```
 
 Attempt summaries must match recorded delivery history.
 
 ---
 
-## Known Limitations of Version 2
+# Version 3
 
-### Blocking HTTP
+Version 3 introduces a worker pool and shared state concurrency.
 
-The worker performs synchronous network requests.
+The objective was to solve the primary bottleneck of Version 2: a single slow merchant response stalling the entire dispatcher and delivery pipeline.
 
-No async runtime is used.
+---
 
-### Single-threaded execution
-
-Dispatcher, worker, retry processing, and delivery all execute on a single thread.
-
-### In-memory state
-
-All state is lost when the process exits.
-
-### Simplified state model
-
-Current event states:
+## Version 3 Architecture
 
 ```text
+Payment
+↓
 Pending
-Delivered
-DeadLettered
+↓
+Dispatcher
+↓
+Shared Work Queue
+↓
+Worker Pool (4 Threads)
+↓
+Concurrent HTTP POSTs
+↓
+Mock Merchant Servers
+
 ```
 
-No intermediate states currently exist.
+---
 
-### Immediate Retries
+## Shared Work Queue
 
-Retries happen immediately.
+Version 3 separates the discovery of work from the execution of work.
 
-There is currently:
+The Dispatcher scans for pending events and pushes their `event_id` into a globally shared queue.
+
+```rust
+static WORK_QUEUE: LazyLock<WorkQueue>
+
+```
+
+This is implemented as an `Arc<Mutex<VecDeque<u64>>>`.
+
+Workers continuously dequeue IDs to process. If the queue is empty, they break their loop.
+
+---
+
+## Shared State & Concurrency
+
+The in-memory database is now shared safely across multiple threads using:
+
+```rust
+Arc<Mutex<InMemoryStore>>
+
+```
+
+This allows workers to concurrently update event statuses and append to the `attempt_history`.
+
+---
+
+## Fine-Grained Lock Scoping
+
+To prevent the `Mutex` from recreating the bottleneck we just solved, workers do not hold the database lock while performing network I/O.
+
+The execution flow inside the worker enforces strict lock boundaries:
 
 ```text
-No Delay
-No Backoff
-No Jitter
+1. Lock DB → Read Event/Payment Data → Drop Lock
+2. Execute Blocking HTTP POST (Concurrent Network I/O)
+3. Lock DB → Append Attempt History & Update Event Status → Drop Lock
+
 ```
 
-### No Worker Pool
+This ensures that network latency never blocks other threads from reading or writing to the store.
 
-Only a single worker executes delivery attempts.
+---
 
-One slow merchant can stall the entire engine.
+## Main Thread Coordination
 
-### No Persistence
+Because execution is now asynchronous to the main thread, Version 3 introduces basic thread coordination.
 
-Payments, events, and delivery history exist only in memory.
+The main process loops and polls the database:
 
-A process restart loses all state.
+```text
+Delivered + DeadLettered == Total Events
+
+```
+
+Sleeping for `100ms` between checks until the invariant is met, at which point it breaks the loop and generates the final report.
+
+---
+
+## Impact on the Engine Report
+
+Version 3 significantly alters the metrics generated by the engine report:
+
+You're right. I missed the concrete numbers.
+
+Here is the updated **Impact on the Engine Report** section incorporating your exact metrics and observed improvements. Replace the old section in your README with this block:
+
+
+## Impact on the Engine Report
+
+Version 3 significantly alters the metrics generated by the engine report, empirically demonstrating the value of concurrent execution.
+
+### Performance Comparison
+
+```text
+Version 2 (Single-Threaded)
+---------------------------
+total_elapsed_ms:       317442
+events_per_second:      0.13
+events_delivered:       30
+events_dead_lettered:   10
+total_attempts:         61
+retried:                21
+p50 latency:            52791.0 ms
+p95 latency:            278438.7 ms
+p99 latency:            309641.4 ms
+
+Version 3 (Worker Pool - 4 Threads)
+-----------------------------------
+total_elapsed_ms:       102114
+events_per_second:      0.39
+events_delivered:       28
+events_dead_lettered:   12
+total_attempts:         56
+retried:                16
+p50 latency:            4245.4 ms
+p95 latency:            100057.4 ms
+p99 latency:            101403.9 ms
+
+```
+
+### Observed Improvements
+
+* **Throughput:** ~3.1x faster total execution. By executing HTTP requests simultaneously, `events_per_second` jumped from 0.13 to 0.39. The system is no longer strictly bound by the latency of sequential network requests.
+* **End-to-End Latency:** ~12.4x lower median (p50) latency. In Version 2, a single timeout skewed the median for all subsequent events. In Version 3, a slow merchant only stalls one worker thread, dropping the p50 latency from ~52.7s down to ~4.2s.
+* **Correctness:** All invariants passed. Introducing shared state and concurrency did not break the event lifecycle, permanent failure handling, or retry tracking logic.
 
 ---
 
 # What The Current System Does Not Include Yet
 
-## Worker Pool
+## Message Channels
 
-No worker threads exist yet.
-
-All processing is still single-threaded.
-
----
-
-## Channels & Concurrency
-
-The project does not yet use:
-
-```text
-Arc
-Mutex
-RwLock
-Channels
-Thread Pools
-```
+The project does not yet use Rust's `mpsc` channels for thread coordination. State sharing relies entirely on `Arc<Mutex<T>>`.
 
 ---
 
@@ -809,6 +938,7 @@ There is currently:
 No Delay
 No Backoff
 No Jitter
+
 ```
 
 ---
@@ -816,12 +946,13 @@ No Jitter
 # Known Limitations
 
 1. Atomicity is simulated rather than enforced by database transactions.
-2. Delivery uses blocking HTTP.
+2. Delivery uses blocking HTTP (no async runtime).
 3. Events do not yet model richer delivery states.
 4. Retry scheduling has no delay or backoff strategy.
 5. State is not persisted across process restarts.
-6. No concurrency exists yet.
-7. Transport errors are not yet modeled with a dedicated error type.
+6. The shared `Mutex` protecting the store creates contention at high concurrency levels.
+7. The `WORK_QUEUE` is unbounded, risking memory exhaustion if production outpaces delivery.
+8. The main thread relies on inefficient sleep-polling rather than condition variables or channel signals.
 
 ---
 
@@ -840,6 +971,7 @@ Concurrency
 Process Crashes
 Network Partitions
 Dead Letter Queues
+
 ```
 
 This project explores those problems incrementally.
@@ -854,32 +986,16 @@ The goal is to understand how reliable event delivery systems are designed.
 
 # Planned Roadmap
 
-## Version 3 — Worker Pool
+## Version 4 — Concurrency & Channels
 
-Introduce a dispatcher feeding a shared work queue and multiple workers consuming delivery jobs.
-
-```text
-Dispatcher
-↓
-Work Queue
-↓
-Multiple Workers
-```
-
----
-
-## Version 4 — Concurrency
-
-Introduce shared state and coordination primitives.
+Replace shared `Mutex` state with message-passing concurrency using channels to eliminate lock contention.
 
 ```text
-Arc
-Mutex
 Channels
 Thread Coordination
-```
+Actor-like patterns
 
----
+```
 
 ## Version 5 — Load Testing
 
@@ -890,9 +1006,8 @@ Stress test the system under increasing delivery volume.
 1,000
 10,000+
 Webhook Deliveries
-```
 
----
+```
 
 ## Version 6 — Backpressure
 
@@ -905,9 +1020,8 @@ Bounded Queues
 Queue Growth
 Flow Control
 Backpressure
-```
 
----
+```
 
 ## Version 7 — Async Runtime Investigation
 
@@ -920,6 +1034,7 @@ Tokio
 Async I/O
 Task Scheduling
 Runtime Tradeoffs
+
 ```
 
 ---
@@ -938,6 +1053,8 @@ Backpressure
 Async Runtimes
 Reliability Engineering
 Distributed Systems
+
 ```
 
 while understanding why each architectural component exists before introducing it.
+

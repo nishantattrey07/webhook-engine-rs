@@ -9,8 +9,12 @@ use std::sync::{Arc,Mutex};
 fn main() {
     let start = Instant::now();
 
-    let store:Db = 
-        Arc::new(Mutex::new(InMemoryStore::new()));
+    let store: Db =
+        Arc::new(
+            Mutex::new(
+                InMemoryStore::new()
+            )
+        );
 
     add_payments_db(store.clone());
 
@@ -18,7 +22,28 @@ fn main() {
 
     worker_pool(store.clone());
 
+    loop {
+        let done = {
+            let store = store.lock().unwrap();
+
+            store.event_delivered_count()
+                + store.event_deadlettered_count()
+                == store.domain_events.len() as u64
+        };
+
+        if done {
+            break;
+        }
+
+        std::thread::sleep(
+            std::time::Duration::from_millis(100)
+        );
+    }
+
     let elapsed = start.elapsed();
 
-    print_engine_report(store.clone(), elapsed);
+    print_engine_report(
+        store.clone(),
+        elapsed,
+    );
 }
