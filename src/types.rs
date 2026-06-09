@@ -1,6 +1,10 @@
 use std::time::{Instant, SystemTime};
-use std::collections::HashMap;
+use std::collections::{HashMap,VecDeque};
 use serde::{Deserialize, Serialize};
+use std::sync::{Arc,Mutex};
+
+pub type WorkQueue =
+    Arc<Mutex<VecDeque<u64>>>;
 
 #[derive(Debug, Clone,PartialEq,Serialize, Deserialize)]
 pub enum PaymentStatus {
