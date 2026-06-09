@@ -1,6 +1,6 @@
-use crate::types::InMemoryStore;
 use std::fmt::Display;
 use std::time::Duration;
+use crate::types::Db;
 
 #[derive(Debug, Clone, Copy)]
 struct LatencyStats {
@@ -134,9 +134,11 @@ fn print_latency_section(
 }
 
 pub fn print_engine_report(
-    store: &InMemoryStore,
+    db: Db,
     total_elapsed: Duration,
-) -> bool {
+) -> bool{
+
+    let store = db.lock().unwrap();
 
     let events_created =
         store.domain_events.len() as u64;

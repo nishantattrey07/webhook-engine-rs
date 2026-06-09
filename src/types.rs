@@ -3,6 +3,8 @@ use std::collections::{HashMap,VecDeque};
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc,Mutex};
 
+pub type Db= 
+    Arc<Mutex<InMemoryStore>>;
 pub type WorkQueue =
     Arc<Mutex<VecDeque<u64>>>;
 

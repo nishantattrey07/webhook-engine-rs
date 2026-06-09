@@ -4,6 +4,6 @@ pub mod dispatcher;
 pub mod payment_service;
 pub mod worker;
 pub mod queue;
-pub mod retry;
 pub mod webhook_simulator;
 pub mod report;
+pub mod worker_pool;

@@ -1,19 +1,19 @@
-use crate::types::{DeliveryOutcome, EventStatus, InMemoryStore, WebhookPayload, WebhookPayloadData,DeliveryAttempt};
-use crate::queue::RETRY_QUEUE;
+use crate::types::{DeliveryOutcome, EventStatus,Db, WebhookPayload, WebhookPayloadData,DeliveryAttempt};
 use crate::webhook_simulator::{send_webhook};
 use std::time::{Instant, SystemTime};
+use crate::queue::enqueue;
 const MAX_ATTEMPT:u64 = 5;
 
 
-pub fn run_worker(db: &mut InMemoryStore, event_id: u64) {
-    
+pub fn run_worker(db:Db, event_id: u64) {
+    let mut store = db.lock().unwrap();
     // Read current event state
     let (
         merchant_id,
         payment_id,
         event_type,
     ) = {
-        let event = match db.domain_events.get(&event_id) {
+        let event = match store.domain_events.get(&event_id) {
             Some(event) => event,
             None => return,
         };
@@ -31,7 +31,7 @@ pub fn run_worker(db: &mut InMemoryStore, event_id: u64) {
 
 
     // Build payload
-    let payment_data = match db.payments.get(&payment_id) {
+    let payment_data = match store.payments.get(&payment_id) {
         Some(payment) => payment,
         None => return,
     };
@@ -51,7 +51,7 @@ pub fn run_worker(db: &mut InMemoryStore, event_id: u64) {
     };
 
     let attempt_count = {
-        let event = match db.domain_events.get_mut(&event_id) {
+        let event = match store.domain_events.get_mut(&event_id) {
             Some(event) => event,
             None => return,
         };
@@ -78,11 +78,11 @@ pub fn run_worker(db: &mut InMemoryStore, event_id: u64) {
     
     // Store attempt history
     
-    let attempt_id = db.next_attempt_id;
+    let attempt_id = db.lock().unwrap().next_attempt_id;
 
-    db.next_attempt_id += 1;
+    db.lock().unwrap().next_attempt_id += 1;
 
-    db.attempt_history.push(DeliveryAttempt {
+    db.lock().unwrap().attempt_history.push(DeliveryAttempt {
         attempt_id,
         event_id,
         http_status,
@@ -97,7 +97,7 @@ pub fn run_worker(db: &mut InMemoryStore, event_id: u64) {
 
     
     // Update event state
-    let event = match db.domain_events.get_mut(&event_id) {
+    let event = match store.domain_events.get_mut(&event_id) {
         Some(event) => event,
         None => return,
     };
@@ -117,9 +117,7 @@ pub fn run_worker(db: &mut InMemoryStore, event_id: u64) {
             } else {
                 event.mark_event_pending();
     
-                RETRY_QUEUE.with(|queue_cell| {
-                    queue_cell.borrow_mut().push_back(event.event_id);
-                });
+                enqueue(event_id);
             }
         }
     
