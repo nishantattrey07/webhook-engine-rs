@@ -1,47 +1,29 @@
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc, Mutex,
-};
-use std::time::{Duration, Instant};
+use webhook_engine::{api, config::AppConfig, db};
 
-use webhook_engine::dispatcher::run_dispatcher;
-use webhook_engine::payment_service::add_payments_db;
-use webhook_engine::report::print_engine_report;
-use webhook_engine::types::{Db, InMemoryStore};
-use webhook_engine::worker_pool::worker_pool;
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    dotenvy::dotenv().ok();
 
-fn main() {
-    let start = Instant::now();
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "webhook_engine=info,tower_http=info".into()),
+        )
+        .init();
 
-    let store: Db = Arc::new(Mutex::new(InMemoryStore::new()));
+    let config = AppConfig::from_env()?;
+    let pool = db::connect(&config).await?;
+    db::run_schema_bootstrap(&pool).await?;
 
-    add_payments_db(store.clone());
+    let app = api::router(api::AppState { pool });
+    let listener = tokio::net::TcpListener::bind(config.bind_addr).await?;
 
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let workers = worker_pool(store.clone(), shutdown.clone());
+    tracing::info!(
+        "webhook engine API listening on http://{}",
+        config.bind_addr
+    );
 
-    loop {
-        run_dispatcher(store.clone());
+    axum::serve(listener, app).await?;
 
-        let done = {
-            let store = store.lock().unwrap();
-            store.event_terminal_count() == store.domain_events.len() as u64
-        };
-
-        if done {
-            break;
-        }
-
-        std::thread::sleep(Duration::from_millis(50));
-    }
-
-    shutdown.store(true, Ordering::Relaxed);
-
-    for handle in workers {
-        handle.join().unwrap();
-    }
-
-    let elapsed = start.elapsed();
-
-    print_engine_report(store.clone(), elapsed);
+    Ok(())
 }

@@ -1,8 +1,9 @@
+use std::collections::HashMap;
 use std::fmt::Display;
 use std::time::{Duration, SystemTime};
 
 use crate::queue::{max_queue_len, queue_len};
-use crate::types::Db;
+use crate::types::{Db, InvariantReport};
 
 #[derive(Debug, Clone, Copy)]
 struct LatencyStats {
@@ -46,7 +47,6 @@ fn summarize(values: &[f64]) -> Option<LatencyStats> {
     }
 
     let mut sorted = values.to_vec();
-
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
     Some(LatencyStats {
@@ -61,17 +61,10 @@ fn summarize(values: &[f64]) -> Option<LatencyStats> {
 fn print_metric_row(label: &str, value: impl Display, suffix: Option<&str>) {
     match suffix {
         Some(suffix) => {
-            println!(
-                "║    {:<24} {:>12} {:<13}║",
-                label, value, suffix
-            );
+            println!("║    {:<24} {:>12} {:<13}║", label, value, suffix);
         }
-
         None => {
-            println!(
-                "║    {:<24} {:>12}              ║",
-                label, value
-            );
+            println!("║    {:<24} {:>12}              ║", label, value);
         }
     }
 }
@@ -84,10 +77,7 @@ fn print_percent_row(label: &str, value: impl Display, percent: f64) {
 }
 
 fn print_latency_row(label: &str, value: f64) {
-    println!(
-        "║    {:<24} {:>12.1}               ║",
-        label, value
-    );
+    println!("║    {:<24} {:>12.1}               ║", label, value);
 }
 
 fn print_latency_section(title: &str, stats: Option<LatencyStats>) {
@@ -102,7 +92,6 @@ fn print_latency_section(title: &str, stats: Option<LatencyStats>) {
             print_latency_row("p99:", stats.p99);
             print_latency_row("max:", stats.max);
         }
-
         None => {
             print_metric_row("min:", "N/A", None);
             print_metric_row("p50:", "N/A", None);
@@ -117,16 +106,162 @@ fn time_diff_ms(start: SystemTime, end: SystemTime) -> Option<f64> {
     end.duration_since(start).ok().map(duration_to_ms)
 }
 
-pub fn print_engine_report(db: Db, total_elapsed: Duration) -> bool {
-    let store = db.lock().unwrap();
+#[derive(Debug)]
+struct AttemptRow {
+    event_id: u64,
+    outcome: String,
+}
 
-    let events_created = store.domain_events.len() as u64;
-    let events_pending = store.event_pending_count();
-    let events_queued = store.event_queued_count();
-    let events_processing = store.event_processing_count();
-    let events_delivered = store.event_delivered_count();
-    let events_deadlettered = store.event_deadlettered_count();
-    let total_attempts = store.attempt_history.len() as u64;
+fn compute_invariants(client: &mut postgres::Client) -> InvariantReport {
+    let total_events = client
+        .query_one("SELECT COUNT(*) FROM webhook_events", &[])
+        .unwrap()
+        .get::<usize, i64>(0) as u64;
+
+    let delivered = client
+        .query_one(
+            "SELECT COUNT(*) FROM webhook_events WHERE status = 'delivered'",
+            &[],
+        )
+        .unwrap()
+        .get::<usize, i64>(0) as u64;
+
+    let deadlettered = client
+        .query_one(
+            "SELECT COUNT(*) FROM webhook_events WHERE status = 'dead_lettered'",
+            &[],
+        )
+        .unwrap()
+        .get::<usize, i64>(0) as u64;
+
+    let lifecycle_lhs = delivered + deadlettered;
+    let lifecycle_rhs = total_events;
+    let lifecycle_passed = lifecycle_lhs == lifecycle_rhs;
+
+    let attempts = client
+        .query(
+            "SELECT event_id, outcome
+            FROM delivery_attempts
+            ORDER BY attempt_id",
+            &[],
+        )
+        .unwrap()
+        .into_iter()
+        .map(|row| AttemptRow {
+            event_id: row.get::<usize, i64>(1) as u64,
+            outcome: row.get::<usize, String>(2),
+        })
+        .collect::<Vec<_>>();
+
+    let mut permanent_failure_violations = 0_u64;
+    for (index, attempt) in attempts.iter().enumerate() {
+        if attempt.outcome == "permanent_failure" {
+            if attempts
+                .iter()
+                .skip(index + 1)
+                .any(|later_attempt| later_attempt.event_id == attempt.event_id)
+            {
+                permanent_failure_violations += 1;
+            }
+        }
+    }
+    let permanent_failure_passed = permanent_failure_violations == 0;
+
+    let event_attempt_counts = client
+        .query(
+            "SELECT event_id, attempt_count
+             FROM webhook_events",
+            &[],
+        )
+        .unwrap()
+        .into_iter()
+        .map(|row| {
+            (
+                row.get::<usize, i64>(0) as u64,
+                row.get::<usize, i64>(1) as u64,
+            )
+        })
+        .collect::<HashMap<_, _>>();
+
+    let mut attempt_count_violations = 0_u64;
+    let mut history_counts: HashMap<u64, u64> = HashMap::new();
+    for attempt in &attempts {
+        *history_counts.entry(attempt.event_id).or_insert(0) += 1;
+    }
+
+    for (event_id, db_count) in event_attempt_counts {
+        let history_count = history_counts.get(&event_id).copied().unwrap_or(0);
+        if history_count != db_count {
+            attempt_count_violations += 1;
+        }
+    }
+
+    let attempt_consistency_passed = attempt_count_violations == 0;
+
+    InvariantReport {
+        lifecycle_passed,
+        permanent_failure_passed,
+        attempt_consistency_passed,
+        lifecycle_lhs,
+        lifecycle_rhs,
+        permanent_failure_violations,
+        attempt_count_violations,
+    }
+}
+
+pub fn print_engine_report(db: Db, total_elapsed: Duration) -> bool {
+    let mut client = db.lock().unwrap();
+
+    let events_created = client
+        .query_one("SELECT COUNT(*) FROM webhook_events", &[])
+        .unwrap()
+        .get::<usize, i64>(0) as u64;
+
+    let events_pending = client
+        .query_one(
+            "SELECT COUNT(*) FROM webhook_events WHERE status = 'pending'",
+            &[],
+        )
+        .unwrap()
+        .get::<usize, i64>(0) as u64;
+
+    let events_queued = client
+        .query_one(
+            "SELECT COUNT(*) FROM webhook_events WHERE status = 'queued'",
+            &[],
+        )
+        .unwrap()
+        .get::<usize, i64>(0) as u64;
+
+    let events_processing = client
+        .query_one(
+            "SELECT COUNT(*) FROM webhook_events WHERE status = 'processing'",
+            &[],
+        )
+        .unwrap()
+        .get::<usize, i64>(0) as u64;
+
+    let events_delivered = client
+        .query_one(
+            "SELECT COUNT(*) FROM webhook_events WHERE status = 'delivered'",
+            &[],
+        )
+        .unwrap()
+        .get::<usize, i64>(0) as u64;
+
+    let events_deadlettered = client
+        .query_one(
+            "SELECT COUNT(*) FROM webhook_events WHERE status = 'dead_lettered'",
+            &[],
+        )
+        .unwrap()
+        .get::<usize, i64>(0) as u64;
+
+    let total_attempts = client
+        .query_one("SELECT COUNT(*) FROM delivery_attempts", &[])
+        .unwrap()
+        .get::<usize, i64>(0) as u64;
+
     let retried = total_attempts.saturating_sub(events_created);
 
     let total_elapsed_ms = total_elapsed.as_millis();
@@ -148,25 +283,40 @@ pub fn print_engine_report(db: Db, total_elapsed: Duration) -> bool {
         0.0
     };
 
-    let end_to_end_latencies_ms: Vec<f64> = store
-        .domain_events
-        .values()
-        .filter_map(|event| {
-            event.final_state_at.and_then(|final_state| {
-                time_diff_ms(event.created_at, final_state)
-            })
+    let end_to_end_latencies_ms: Vec<f64> = client
+        .query(
+            "SELECT created_at, final_state_at
+             FROM webhook_events
+             WHERE final_state_at IS NOT NULL",
+            &[],
+        )
+        .unwrap()
+        .into_iter()
+        .filter_map(|row| {
+            let created_at: SystemTime = row.get(0);
+            let final_state_at: SystemTime = row.get(1);
+            time_diff_ms(created_at, final_state_at)
         })
         .collect();
 
-    let http_call_durations_ms: Vec<f64> = store
-        .attempt_history
-        .iter()
-        .filter_map(|attempt| time_diff_ms(attempt.started_at, attempt.completed_at))
+    let http_call_durations_ms: Vec<f64> = client
+        .query(
+            "SELECT started_at, completed_at
+             FROM delivery_attempts",
+            &[],
+        )
+        .unwrap()
+        .into_iter()
+        .filter_map(|row| {
+            let started_at: SystemTime = row.get(0);
+            let completed_at: SystemTime = row.get(1);
+            time_diff_ms(started_at, completed_at)
+        })
         .collect();
 
     let e2e_stats = summarize(&end_to_end_latencies_ms);
     let http_stats = summarize(&http_call_durations_ms);
-    let invariant_report = store.verify_invariant();
+    let invariant_report = compute_invariants(&mut client);
     let all_passed = invariant_report.all_passed();
 
     println!("╔══════════════════════════════════════════════════════════╗");
@@ -175,7 +325,7 @@ pub fn print_engine_report(db: Db, total_elapsed: Duration) -> bool {
     println!("╠══════════════════════════════════════════════════════════╣");
     println!("║  CONFIGURATION                                           ║");
 
-    print_metric_row("engine_version:", "v2.5", None);
+    print_metric_row("engine_version:", "v3", None);
     print_metric_row("max_attempts:", 5, None);
     print_metric_row("events_in_run:", events_created, None);
 
@@ -183,7 +333,11 @@ pub fn print_engine_report(db: Db, total_elapsed: Duration) -> bool {
     println!("║  THROUGHPUT                                              ║");
 
     print_metric_row("total_elapsed_ms:", total_elapsed_ms, None);
-    print_metric_row("events_per_second:", format!("{:.2}", events_per_second), None);
+    print_metric_row(
+        "events_per_second:",
+        format!("{:.2}", events_per_second),
+        None,
+    );
     print_metric_row("queue_len_current:", queue_len(), None);
     print_metric_row("queue_len_max:", max_queue_len(), None);
 
@@ -191,11 +345,39 @@ pub fn print_engine_report(db: Db, total_elapsed: Duration) -> bool {
     println!("║  OUTCOMES                                                ║");
 
     print_percent_row("events_created:", events_created, 100.0);
-    print_percent_row("events_pending:", events_pending, if events_created > 0 { (events_pending as f64 * 100.0) / events_created as f64 } else { 0.0 });
-    print_percent_row("events_queued:", events_queued, if events_created > 0 { (events_queued as f64 * 100.0) / events_created as f64 } else { 0.0 });
-    print_percent_row("events_processing:", events_processing, if events_created > 0 { (events_processing as f64 * 100.0) / events_created as f64 } else { 0.0 });
+    print_percent_row(
+        "events_pending:",
+        events_pending,
+        if events_created > 0 {
+            (events_pending as f64 * 100.0) / events_created as f64
+        } else {
+            0.0
+        },
+    );
+    print_percent_row(
+        "events_queued:",
+        events_queued,
+        if events_created > 0 {
+            (events_queued as f64 * 100.0) / events_created as f64
+        } else {
+            0.0
+        },
+    );
+    print_percent_row(
+        "events_processing:",
+        events_processing,
+        if events_created > 0 {
+            (events_processing as f64 * 100.0) / events_created as f64
+        } else {
+            0.0
+        },
+    );
     print_percent_row("events_delivered:", events_delivered, delivered_pct);
-    print_percent_row("events_dead_lettered:", events_deadlettered, deadlettered_pct);
+    print_percent_row(
+        "events_dead_lettered:",
+        events_deadlettered,
+        deadlettered_pct,
+    );
 
     print_metric_row("total_attempts:", total_attempts, None);
     print_metric_row("retried:", retried, None);

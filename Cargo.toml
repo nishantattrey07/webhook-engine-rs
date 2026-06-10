@@ -1,14 +1,19 @@
 [package]
 name = "webhook_engine"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2024"
 
 [dependencies]
-rand = "0.8"
-
-# HTTP Client
+axum = "0.7"
+chrono = { version = "0.4", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "chrono", "json"] }
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+postgres = "0.19"
 ureq = { version = "3.3", features = ["json"] }
-
-# JSON Serialization
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+dotenvy = "0.15"
