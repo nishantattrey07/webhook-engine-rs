@@ -67,6 +67,7 @@ pub struct CreateEndpointRequest {
     pub url: String,
     pub secret: String,
     pub description: Option<String>,
+    pub max_attempts: Option<i64>,
     pub subscribed_events: Vec<String>,
 }
 
@@ -75,6 +76,7 @@ pub struct UpdateEndpointRequest {
     pub url: Option<String>,
     pub enabled: Option<bool>,
     pub description: Option<String>,
+    pub max_attempts: Option<i64>,
     pub subscribed_events: Option<Vec<String>>,
 }
 
@@ -92,6 +94,7 @@ pub struct EndpointListItem {
     pub url: String,
     pub active_secret_version_id: Option<i64>,
     pub enabled: bool,
+    pub max_attempts: i64,
     pub description: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -194,4 +197,89 @@ pub struct BulkRetryDeliveriesResponse {
 pub struct BulkRetrySkip {
     pub delivery_id: i64,
     pub reason: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DeliveryListQuery {
+    pub merchant_id: Option<i64>,
+    pub endpoint_id: Option<i64>,
+    pub event_id: Option<i64>,
+    pub status: Option<String>,
+    pub cursor: Option<i64>,
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PaginatedDeliveriesResponse {
+    pub items: Vec<DeliveryListItem>,
+    pub next_cursor: Option<i64>,
+    pub limit: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DashboardSummary {
+    pub total_events: i64,
+    pub total_deliveries: i64,
+    pub pending_deliveries: i64,
+    pub queued_deliveries: i64,
+    pub processing_deliveries: i64,
+    pub retrying_deliveries: i64,
+    pub delivered_deliveries: i64,
+    pub dead_lettered_deliveries: i64,
+    pub total_endpoints: i64,
+    pub enabled_endpoints: i64,
+    pub attempts_24h: i64,
+    pub failed_attempts_24h: i64,
+}
+
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct EndpointStatsItem {
+    pub endpoint_id: i64,
+    pub merchant_id: i64,
+    pub url: String,
+    pub enabled: bool,
+    pub description: Option<String>,
+    pub total_deliveries: i64,
+    pub delivered_deliveries: i64,
+    pub retrying_deliveries: i64,
+    pub dead_lettered_deliveries: i64,
+    pub last_delivery_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DeliveryRetryLineage {
+    pub original_delivery_id: Option<i64>,
+    pub retry_delivery_ids: Vec<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DeliveryDetailResponse {
+    pub delivery: DeliveryListItem,
+    pub event: EventListItem,
+    pub attempts: Vec<DeliveryAttemptItem>,
+    pub trace: Vec<DeliveryTraceItem>,
+    pub retry_lineage: DeliveryRetryLineage,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TraceGraphResponse {
+    pub nodes: Vec<TraceGraphNode>,
+    pub edges: Vec<TraceGraphEdge>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TraceGraphNode {
+    pub id: String,
+    pub step: String,
+    pub status: String,
+    pub title: String,
+    pub occurred_at: DateTime<Utc>,
+    pub metadata_json: Value,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TraceGraphEdge {
+    pub id: String,
+    pub source: String,
+    pub target: String,
 }

@@ -7,9 +7,12 @@ use crate::{
     models::{
         BulkRetryDeliveriesRequest, BulkRetryDeliveriesResponse, BulkRetrySkip,
         CreateBulkPaymentsRequest, CreateBulkPaymentsResponse, CreateEndpointRequest,
-        CreateEndpointResponse, CreatePaymentRequest, CreatePaymentResponse, DeliveryAttemptItem,
-        DeliveryListItem, DeliveryTraceItem, EndpointListItem, EventFanoutResponse, EventListItem,
-        RetryDeliveryRequest, RetryDeliveryResponse, UpdateEndpointRequest,
+        CreateEndpointResponse, CreatePaymentRequest, CreatePaymentResponse, DashboardSummary,
+        DeliveryAttemptItem, DeliveryDetailResponse, DeliveryListItem, DeliveryListQuery,
+        DeliveryRetryLineage, DeliveryTraceItem, EndpointListItem, EndpointStatsItem,
+        EventFanoutResponse, EventListItem, PaginatedDeliveriesResponse, RetryDeliveryRequest,
+        RetryDeliveryResponse, TraceGraphEdge, TraceGraphNode, TraceGraphResponse,
+        UpdateEndpointRequest,
     },
 };
 
@@ -32,6 +35,7 @@ pub async fn create_endpoint(
             "at least one subscribed event is required".to_string(),
         ));
     }
+    let max_attempts = validate_max_attempts(request.max_attempts)?;
 
     for event_type in &request.subscribed_events {
         if !ALLOWED_EVENT_TYPES.contains(&event_type.as_str()) {
@@ -49,15 +53,17 @@ pub async fn create_endpoint(
             merchant_id,
             url,
             enabled,
+            max_attempts,
             description,
             created_at,
             updated_at
          )
-         VALUES ($1, $2, TRUE, $3, NOW(), NOW())
+         VALUES ($1, $2, TRUE, $3, $4, NOW(), NOW())
          RETURNING endpoint_id",
     )
     .bind(request.merchant_id)
     .bind(request.url)
+    .bind(max_attempts)
     .bind(request.description)
     .fetch_one(&mut *tx)
     .await?
@@ -150,6 +156,9 @@ pub async fn update_endpoint(
             }
         }
     }
+    if let Some(max_attempts) = request.max_attempts {
+        validate_max_attempts(Some(max_attempts))?;
+    }
 
     let mut tx = pool.begin().await?;
 
@@ -158,6 +167,7 @@ pub async fn update_endpoint(
          SET url = COALESCE($2, url),
              enabled = COALESCE($3, enabled),
              description = COALESCE($4, description),
+             max_attempts = COALESCE($5, max_attempts),
              updated_at = NOW()
          WHERE endpoint_id = $1",
     )
@@ -165,6 +175,7 @@ pub async fn update_endpoint(
     .bind(request.url)
     .bind(request.enabled)
     .bind(request.description)
+    .bind(request.max_attempts)
     .execute(&mut *tx)
     .await?;
 
@@ -283,7 +294,8 @@ async fn create_payment_in_tx(
                 e.endpoint_id,
                 e.merchant_id,
                 e.url,
-                e.active_secret_version_id
+                e.active_secret_version_id,
+                e.max_attempts
             FROM webhook_endpoints e
             INNER JOIN webhook_endpoint_subscriptions s
                 ON s.endpoint_id = e.endpoint_id
@@ -310,7 +322,7 @@ async fn create_payment_in_tx(
                 url,
                 active_secret_version_id,
                 'pending',
-                5,
+                max_attempts,
                 NOW(),
                 NOW()
             FROM subscribed_endpoints
@@ -422,6 +434,18 @@ fn validate_endpoint_url(url: &str) -> AppResult<()> {
     Ok(())
 }
 
+fn validate_max_attempts(max_attempts: Option<i64>) -> AppResult<i64> {
+    let max_attempts = max_attempts.unwrap_or(5);
+
+    if !(1..=20).contains(&max_attempts) {
+        return Err(AppError::BadRequest(
+            "max_attempts must be between 1 and 20".to_string(),
+        ));
+    }
+
+    Ok(max_attempts)
+}
+
 fn validate_payment_request(request: &CreatePaymentRequest) -> AppResult<()> {
     if request.amount < 0 {
         return Err(AppError::BadRequest(
@@ -521,6 +545,7 @@ pub async fn list_endpoints(pool: &PgPool) -> AppResult<Vec<EndpointListItem>> {
             e.url,
             e.active_secret_version_id,
             e.enabled,
+            e.max_attempts,
             e.description,
             e.created_at,
             e.updated_at,
@@ -549,6 +574,7 @@ pub async fn get_endpoint(pool: &PgPool, endpoint_id: i64) -> AppResult<Endpoint
             e.url,
             e.active_secret_version_id,
             e.enabled,
+            e.max_attempts,
             e.description,
             e.created_at,
             e.updated_at,
@@ -569,6 +595,71 @@ pub async fn get_endpoint(pool: &PgPool, endpoint_id: i64) -> AppResult<Endpoint
     .ok_or_else(|| AppError::NotFound(format!("endpoint {} not found", endpoint_id)))?;
 
     Ok(endpoint)
+}
+
+pub async fn list_endpoint_stats(pool: &PgPool) -> AppResult<Vec<EndpointStatsItem>> {
+    let rows = sqlx::query_as::<_, EndpointStatsItem>(
+        "SELECT
+            e.endpoint_id,
+            e.merchant_id,
+            e.url,
+            e.enabled,
+            e.description,
+            COUNT(d.delivery_id)::BIGINT AS total_deliveries,
+            COUNT(d.delivery_id) FILTER (WHERE d.status = 'delivered')::BIGINT AS delivered_deliveries,
+            COUNT(d.delivery_id) FILTER (WHERE d.status = 'retrying')::BIGINT AS retrying_deliveries,
+            COUNT(d.delivery_id) FILTER (WHERE d.status = 'dead_lettered')::BIGINT AS dead_lettered_deliveries,
+            MAX(d.created_at) AS last_delivery_at
+         FROM webhook_endpoints e
+         LEFT JOIN webhook_deliveries d
+            ON d.endpoint_id = e.endpoint_id
+         GROUP BY e.endpoint_id
+         ORDER BY total_deliveries DESC, e.created_at DESC",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows)
+}
+
+pub async fn get_dashboard_summary(pool: &PgPool) -> AppResult<DashboardSummary> {
+    let row = sqlx::query(
+        "SELECT
+            (SELECT COUNT(*)::BIGINT FROM domain_events) AS total_events,
+            (SELECT COUNT(*)::BIGINT FROM webhook_deliveries) AS total_deliveries,
+            (SELECT COUNT(*)::BIGINT FROM webhook_deliveries WHERE status = 'pending') AS pending_deliveries,
+            (SELECT COUNT(*)::BIGINT FROM webhook_deliveries WHERE status = 'queued') AS queued_deliveries,
+            (SELECT COUNT(*)::BIGINT FROM webhook_deliveries WHERE status = 'processing') AS processing_deliveries,
+            (SELECT COUNT(*)::BIGINT FROM webhook_deliveries WHERE status = 'retrying') AS retrying_deliveries,
+            (SELECT COUNT(*)::BIGINT FROM webhook_deliveries WHERE status = 'delivered') AS delivered_deliveries,
+            (SELECT COUNT(*)::BIGINT FROM webhook_deliveries WHERE status = 'dead_lettered') AS dead_lettered_deliveries,
+            (SELECT COUNT(*)::BIGINT FROM webhook_endpoints) AS total_endpoints,
+            (SELECT COUNT(*)::BIGINT FROM webhook_endpoints WHERE enabled = TRUE) AS enabled_endpoints,
+            (SELECT COUNT(*)::BIGINT FROM delivery_attempts WHERE started_at >= NOW() - INTERVAL '24 hours') AS attempts_24h,
+            (
+                SELECT COUNT(*)::BIGINT
+                FROM delivery_attempts
+                WHERE started_at >= NOW() - INTERVAL '24 hours'
+                  AND outcome IN ('temporary_failure', 'permanent_failure', 'timeout', 'abandoned')
+            ) AS failed_attempts_24h",
+    )
+    .fetch_one(pool)
+    .await?;
+
+    Ok(DashboardSummary {
+        total_events: row.get("total_events"),
+        total_deliveries: row.get("total_deliveries"),
+        pending_deliveries: row.get("pending_deliveries"),
+        queued_deliveries: row.get("queued_deliveries"),
+        processing_deliveries: row.get("processing_deliveries"),
+        retrying_deliveries: row.get("retrying_deliveries"),
+        delivered_deliveries: row.get("delivered_deliveries"),
+        dead_lettered_deliveries: row.get("dead_lettered_deliveries"),
+        total_endpoints: row.get("total_endpoints"),
+        enabled_endpoints: row.get("enabled_endpoints"),
+        attempts_24h: row.get("attempts_24h"),
+        failed_attempts_24h: row.get("failed_attempts_24h"),
+    })
 }
 
 pub async fn list_deliveries(pool: &PgPool) -> AppResult<Vec<DeliveryListItem>> {
@@ -598,6 +689,63 @@ pub async fn list_deliveries(pool: &PgPool) -> AppResult<Vec<DeliveryListItem>> 
     .await?;
 
     Ok(rows)
+}
+
+pub async fn list_dashboard_deliveries(
+    pool: &PgPool,
+    query: DeliveryListQuery,
+) -> AppResult<PaginatedDeliveriesResponse> {
+    let limit = query.limit.unwrap_or(50).clamp(1, 100);
+    let fetch_limit = limit + 1;
+
+    let rows = sqlx::query_as::<_, DeliveryListItem>(
+        "SELECT
+            d.delivery_id,
+            d.event_id,
+            d.merchant_id,
+            d.endpoint_id,
+            d.endpoint_url,
+            d.status,
+            d.max_attempts,
+            d.next_attempt_at,
+            d.last_error,
+            d.created_at,
+            d.updated_at,
+            d.final_state_at,
+            COUNT(a.attempt_id)::BIGINT AS attempt_count
+         FROM webhook_deliveries d
+         LEFT JOIN delivery_attempts a
+            ON a.delivery_id = d.delivery_id
+         WHERE ($1::BIGINT IS NULL OR d.merchant_id = $1)
+           AND ($2::BIGINT IS NULL OR d.endpoint_id = $2)
+           AND ($3::BIGINT IS NULL OR d.event_id = $3)
+           AND ($4::TEXT IS NULL OR d.status = $4)
+           AND ($5::BIGINT IS NULL OR d.delivery_id < $5)
+         GROUP BY d.delivery_id
+         ORDER BY d.delivery_id DESC
+         LIMIT $6",
+    )
+    .bind(query.merchant_id)
+    .bind(query.endpoint_id)
+    .bind(query.event_id)
+    .bind(query.status)
+    .bind(query.cursor)
+    .bind(fetch_limit)
+    .fetch_all(pool)
+    .await?;
+
+    let mut items = rows;
+    let next_cursor = if items.len() > limit as usize {
+        items.pop().map(|item| item.delivery_id)
+    } else {
+        None
+    };
+
+    Ok(PaginatedDeliveriesResponse {
+        items,
+        next_cursor,
+        limit,
+    })
 }
 
 pub async fn list_deliveries_for_event(
@@ -661,6 +809,59 @@ pub async fn get_delivery(pool: &PgPool, delivery_id: i64) -> AppResult<Delivery
     .ok_or_else(|| AppError::NotFound(format!("delivery {} not found", delivery_id)))?;
 
     Ok(row)
+}
+
+pub async fn get_delivery_detail(
+    pool: &PgPool,
+    delivery_id: i64,
+) -> AppResult<DeliveryDetailResponse> {
+    let delivery = get_delivery(pool, delivery_id).await?;
+    let event = get_event(pool, delivery.event_id).await?;
+    let attempts = list_delivery_attempts(pool, delivery_id).await?;
+    let trace = list_delivery_trace(pool, delivery_id).await?;
+    let retry_lineage = get_delivery_retry_lineage(pool, delivery_id).await?;
+
+    Ok(DeliveryDetailResponse {
+        delivery,
+        event,
+        attempts,
+        trace,
+        retry_lineage,
+    })
+}
+
+async fn get_delivery_retry_lineage(
+    pool: &PgPool,
+    delivery_id: i64,
+) -> AppResult<DeliveryRetryLineage> {
+    let original_delivery_id: Option<i64> = sqlx::query(
+        "SELECT manually_retried_from_delivery_id
+         FROM webhook_deliveries
+         WHERE delivery_id = $1",
+    )
+    .bind(delivery_id)
+    .fetch_optional(pool)
+    .await?
+    .ok_or_else(|| AppError::NotFound(format!("delivery {} not found", delivery_id)))?
+    .get("manually_retried_from_delivery_id");
+
+    let retry_rows = sqlx::query(
+        "SELECT delivery_id
+         FROM webhook_deliveries
+         WHERE manually_retried_from_delivery_id = $1
+         ORDER BY delivery_id ASC",
+    )
+    .bind(delivery_id)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(DeliveryRetryLineage {
+        original_delivery_id,
+        retry_delivery_ids: retry_rows
+            .into_iter()
+            .map(|row| row.get("delivery_id"))
+            .collect(),
+    })
 }
 
 pub async fn retry_delivery(
@@ -945,4 +1146,33 @@ pub async fn list_delivery_trace(
     .await?;
 
     Ok(rows)
+}
+
+pub async fn get_delivery_trace_graph(
+    pool: &PgPool,
+    delivery_id: i64,
+) -> AppResult<TraceGraphResponse> {
+    let trace = list_delivery_trace(pool, delivery_id).await?;
+    let nodes = trace
+        .iter()
+        .map(|item| TraceGraphNode {
+            id: format!("trace-{}", item.trace_id),
+            step: item.step.clone(),
+            status: item.status.clone(),
+            title: item.title.clone(),
+            occurred_at: item.occurred_at,
+            metadata_json: item.metadata_json.clone(),
+        })
+        .collect::<Vec<_>>();
+
+    let edges = nodes
+        .windows(2)
+        .map(|window| TraceGraphEdge {
+            id: format!("{}-{}", window[0].id, window[1].id),
+            source: window[0].id.clone(),
+            target: window[1].id.clone(),
+        })
+        .collect::<Vec<_>>();
+
+    Ok(TraceGraphResponse { nodes, edges })
 }

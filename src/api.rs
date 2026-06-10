@@ -1,6 +1,6 @@
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     routing::{get, patch, post},
 };
 use sqlx::PgPool;
@@ -25,12 +25,19 @@ pub fn router(state: AppState) -> Router {
         .route("/api/endpoints/:endpoint_id", patch(update_endpoint))
         .route("/api/payments", post(create_payment))
         .route("/api/payments/bulk", post(create_bulk_payments))
+        .route("/api/dashboard/summary", get(get_dashboard_summary))
+        .route("/api/dashboard/deliveries", get(list_dashboard_deliveries))
+        .route("/api/endpoints/stats", get(list_endpoint_stats))
         .route("/api/events", get(list_events))
         .route("/api/events/:event_id", get(get_event))
         .route("/api/events/:event_id/fanout", get(get_event_fanout))
         .route("/api/deliveries", get(list_deliveries))
         .route("/api/deliveries/bulk-retry", post(bulk_retry_deliveries))
         .route("/api/deliveries/:delivery_id", get(get_delivery))
+        .route(
+            "/api/deliveries/:delivery_id/detail",
+            get(get_delivery_detail),
+        )
         .route("/api/deliveries/:delivery_id/retry", post(retry_delivery))
         .route(
             "/api/deliveries/:delivery_id/attempts",
@@ -39,6 +46,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/deliveries/:delivery_id/trace",
             get(list_delivery_trace),
+        )
+        .route(
+            "/api/deliveries/:delivery_id/trace-graph",
+            get(get_delivery_trace_graph),
         )
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive())
@@ -89,6 +100,28 @@ async fn update_endpoint(
     Ok(Json(endpoint))
 }
 
+async fn list_endpoint_stats(
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<crate::models::EndpointStatsItem>>> {
+    let stats = services::list_endpoint_stats(&state.pool).await?;
+    Ok(Json(stats))
+}
+
+async fn get_dashboard_summary(
+    State(state): State<AppState>,
+) -> AppResult<Json<crate::models::DashboardSummary>> {
+    let summary = services::get_dashboard_summary(&state.pool).await?;
+    Ok(Json(summary))
+}
+
+async fn list_dashboard_deliveries(
+    State(state): State<AppState>,
+    Query(query): Query<crate::models::DeliveryListQuery>,
+) -> AppResult<Json<crate::models::PaginatedDeliveriesResponse>> {
+    let deliveries = services::list_dashboard_deliveries(&state.pool, query).await?;
+    Ok(Json(deliveries))
+}
+
 async fn list_events(
     State(state): State<AppState>,
 ) -> AppResult<Json<Vec<crate::models::EventListItem>>> {
@@ -127,6 +160,14 @@ async fn get_delivery(
     Ok(Json(delivery))
 }
 
+async fn get_delivery_detail(
+    State(state): State<AppState>,
+    Path(delivery_id): Path<i64>,
+) -> AppResult<Json<crate::models::DeliveryDetailResponse>> {
+    let detail = services::get_delivery_detail(&state.pool, delivery_id).await?;
+    Ok(Json(detail))
+}
+
 async fn retry_delivery(
     State(state): State<AppState>,
     Path(delivery_id): Path<i64>,
@@ -158,4 +199,12 @@ async fn list_delivery_trace(
 ) -> AppResult<Json<Vec<crate::models::DeliveryTraceItem>>> {
     let trace = services::list_delivery_trace(&state.pool, delivery_id).await?;
     Ok(Json(trace))
+}
+
+async fn get_delivery_trace_graph(
+    State(state): State<AppState>,
+    Path(delivery_id): Path<i64>,
+) -> AppResult<Json<crate::models::TraceGraphResponse>> {
+    let graph = services::get_delivery_trace_graph(&state.pool, delivery_id).await?;
+    Ok(Json(graph))
 }
