@@ -148,8 +148,8 @@ fn compute_invariants(client: &mut postgres::Client) -> InvariantReport {
         .unwrap()
         .into_iter()
         .map(|row| AttemptRow {
-            event_id: row.get::<usize, i64>(1) as u64,
-            outcome: row.get::<usize, String>(2),
+            event_id: row.get::<usize, i64>(0) as u64,
+            outcome: row.get::<usize, String>(1),
         })
         .collect::<Vec<_>>();
 
