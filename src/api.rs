@@ -29,7 +29,9 @@ pub fn router(state: AppState) -> Router {
         .route("/api/events/:event_id", get(get_event))
         .route("/api/events/:event_id/fanout", get(get_event_fanout))
         .route("/api/deliveries", get(list_deliveries))
+        .route("/api/deliveries/bulk-retry", post(bulk_retry_deliveries))
         .route("/api/deliveries/:delivery_id", get(get_delivery))
+        .route("/api/deliveries/:delivery_id/retry", post(retry_delivery))
         .route(
             "/api/deliveries/:delivery_id/attempts",
             get(list_delivery_attempts),
@@ -123,6 +125,23 @@ async fn get_delivery(
 ) -> AppResult<Json<crate::models::DeliveryListItem>> {
     let delivery = services::get_delivery(&state.pool, delivery_id).await?;
     Ok(Json(delivery))
+}
+
+async fn retry_delivery(
+    State(state): State<AppState>,
+    Path(delivery_id): Path<i64>,
+    Json(request): Json<crate::models::RetryDeliveryRequest>,
+) -> AppResult<Json<crate::models::RetryDeliveryResponse>> {
+    let response = services::retry_delivery(&state.pool, delivery_id, request).await?;
+    Ok(Json(response))
+}
+
+async fn bulk_retry_deliveries(
+    State(state): State<AppState>,
+    Json(request): Json<crate::models::BulkRetryDeliveriesRequest>,
+) -> AppResult<Json<crate::models::BulkRetryDeliveriesResponse>> {
+    let response = services::bulk_retry_deliveries(&state.pool, request).await?;
+    Ok(Json(response))
 }
 
 async fn list_delivery_attempts(

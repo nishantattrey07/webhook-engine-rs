@@ -161,3 +161,37 @@ pub struct EventFanoutResponse {
     pub event: EventListItem,
     pub deliveries: Vec<DeliveryListItem>,
 }
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RetryDeliveryRequest {
+    pub reason: Option<String>,
+    pub requested_by: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RetryDeliveryResponse {
+    pub original_delivery_id: i64,
+    pub new_delivery_id: i64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct BulkRetryDeliveriesRequest {
+    pub delivery_ids: Vec<i64>,
+    pub reason: Option<String>,
+    pub requested_by: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BulkRetryDeliveriesResponse {
+    pub retried: Vec<RetryDeliveryResponse>,
+    pub skipped: Vec<BulkRetrySkip>,
+    pub total_requested: usize,
+    pub total_retried: usize,
+    pub total_skipped: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BulkRetrySkip {
+    pub delivery_id: i64,
+    pub reason: String,
+}

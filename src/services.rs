@@ -5,10 +5,11 @@ use url::Url;
 use crate::{
     error::{AppError, AppResult},
     models::{
+        BulkRetryDeliveriesRequest, BulkRetryDeliveriesResponse, BulkRetrySkip,
         CreateBulkPaymentsRequest, CreateBulkPaymentsResponse, CreateEndpointRequest,
         CreateEndpointResponse, CreatePaymentRequest, CreatePaymentResponse, DeliveryAttemptItem,
         DeliveryListItem, DeliveryTraceItem, EndpointListItem, EventFanoutResponse, EventListItem,
-        UpdateEndpointRequest,
+        RetryDeliveryRequest, RetryDeliveryResponse, UpdateEndpointRequest,
     },
 };
 
@@ -660,6 +661,234 @@ pub async fn get_delivery(pool: &PgPool, delivery_id: i64) -> AppResult<Delivery
     .ok_or_else(|| AppError::NotFound(format!("delivery {} not found", delivery_id)))?;
 
     Ok(row)
+}
+
+pub async fn retry_delivery(
+    pool: &PgPool,
+    delivery_id: i64,
+    request: RetryDeliveryRequest,
+) -> AppResult<RetryDeliveryResponse> {
+    let mut tx = pool.begin().await?;
+    let response = retry_delivery_in_tx(
+        &mut tx,
+        delivery_id,
+        request.reason.as_deref(),
+        request.requested_by.as_deref(),
+    )
+    .await?;
+    tx.commit().await?;
+
+    Ok(response)
+}
+
+pub async fn bulk_retry_deliveries(
+    pool: &PgPool,
+    request: BulkRetryDeliveriesRequest,
+) -> AppResult<BulkRetryDeliveriesResponse> {
+    if request.delivery_ids.is_empty() {
+        return Err(AppError::BadRequest(
+            "at least one delivery id is required".to_string(),
+        ));
+    }
+
+    if request.delivery_ids.len() > 100 {
+        return Err(AppError::BadRequest(
+            "bulk retry is limited to 100 deliveries".to_string(),
+        ));
+    }
+
+    let total_requested = request.delivery_ids.len();
+    let mut retried = Vec::new();
+    let mut skipped = Vec::new();
+    let mut tx = pool.begin().await?;
+
+    for delivery_id in dedupe_delivery_ids(request.delivery_ids) {
+        match retry_delivery_in_tx(
+            &mut tx,
+            delivery_id,
+            request.reason.as_deref(),
+            request.requested_by.as_deref(),
+        )
+        .await
+        {
+            Ok(response) => retried.push(response),
+            Err(AppError::NotFound(reason)) | Err(AppError::BadRequest(reason)) => {
+                skipped.push(BulkRetrySkip {
+                    delivery_id,
+                    reason,
+                });
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    tx.commit().await?;
+
+    Ok(BulkRetryDeliveriesResponse {
+        total_requested,
+        total_retried: retried.len(),
+        total_skipped: skipped.len(),
+        retried,
+        skipped,
+    })
+}
+
+async fn retry_delivery_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    delivery_id: i64,
+    reason: Option<&str>,
+    requested_by: Option<&str>,
+) -> AppResult<RetryDeliveryResponse> {
+    let original = sqlx::query(
+        "SELECT
+            delivery_id,
+            event_id,
+            endpoint_id,
+            merchant_id,
+            endpoint_url,
+            secret_version_id,
+            status,
+            max_attempts
+         FROM webhook_deliveries
+         WHERE delivery_id = $1",
+    )
+    .bind(delivery_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or_else(|| AppError::NotFound(format!("delivery {} not found", delivery_id)))?;
+
+    let status: String = original.get("status");
+    if !matches!(status.as_str(), "delivered" | "dead_lettered") {
+        return Err(AppError::BadRequest(format!(
+            "delivery {} cannot be manually retried while status is {}",
+            delivery_id, status
+        )));
+    }
+
+    let event_id: i64 = original.get("event_id");
+    let endpoint_id: i64 = original.get("endpoint_id");
+    let merchant_id: i64 = original.get("merchant_id");
+    let endpoint_url: String = original.get("endpoint_url");
+    let secret_version_id: Option<i64> = original.get("secret_version_id");
+    let max_attempts: i64 = original.get("max_attempts");
+
+    let new_delivery_id: i64 = sqlx::query(
+        "INSERT INTO webhook_deliveries (
+            event_id,
+            endpoint_id,
+            merchant_id,
+            endpoint_url,
+            secret_version_id,
+            status,
+            max_attempts,
+            next_attempt_at,
+            manually_retried_from_delivery_id,
+            retry_reason,
+            requested_by,
+            created_at,
+            updated_at
+         )
+         VALUES (
+            $1,
+            $2,
+            $3,
+            $4,
+            $5,
+            'pending',
+            $6,
+            NOW(),
+            $7,
+            $8,
+            $9,
+            NOW(),
+            NOW()
+         )
+         RETURNING delivery_id",
+    )
+    .bind(event_id)
+    .bind(endpoint_id)
+    .bind(merchant_id)
+    .bind(endpoint_url)
+    .bind(secret_version_id)
+    .bind(max_attempts)
+    .bind(delivery_id)
+    .bind(reason)
+    .bind(requested_by)
+    .fetch_one(&mut **tx)
+    .await?
+    .get("delivery_id");
+
+    append_delivery_trace_in_tx(
+        tx,
+        delivery_id,
+        event_id,
+        "manual_retry_requested",
+        "succeeded",
+        "Manual retry requested",
+        json!({ "new_delivery_id": new_delivery_id, "reason": reason, "requested_by": requested_by }),
+    )
+    .await?;
+
+    append_delivery_trace_in_tx(
+        tx,
+        new_delivery_id,
+        event_id,
+        "delivery_created",
+        "succeeded",
+        "Retry delivery created",
+        json!({ "original_delivery_id": delivery_id, "reason": reason, "requested_by": requested_by }),
+    )
+    .await?;
+
+    Ok(RetryDeliveryResponse {
+        original_delivery_id: delivery_id,
+        new_delivery_id,
+    })
+}
+
+async fn append_delivery_trace_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    delivery_id: i64,
+    event_id: i64,
+    step: &str,
+    status: &str,
+    title: &str,
+    metadata: serde_json::Value,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO delivery_trace_events (
+            delivery_id,
+            event_id,
+            step,
+            status,
+            title,
+            metadata_json,
+            occurred_at
+         )
+         VALUES ($1, $2, $3, $4, $5, $6, NOW())",
+    )
+    .bind(delivery_id)
+    .bind(event_id)
+    .bind(step)
+    .bind(status)
+    .bind(title)
+    .bind(metadata)
+    .execute(&mut **tx)
+    .await?;
+
+    Ok(())
+}
+
+fn dedupe_delivery_ids(delivery_ids: Vec<i64>) -> Vec<i64> {
+    let mut deduped = Vec::with_capacity(delivery_ids.len());
+
+    for delivery_id in delivery_ids {
+        if !deduped.contains(&delivery_id) {
+            deduped.push(delivery_id);
+        }
+    }
+
+    deduped
 }
 
 pub async fn list_delivery_attempts(
