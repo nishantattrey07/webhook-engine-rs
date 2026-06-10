@@ -2,6 +2,7 @@ pub mod api;
 pub mod config;
 pub mod data;
 pub mod db;
+pub mod delivery_worker;
 pub mod dispatcher;
 pub mod error;
 pub mod models;

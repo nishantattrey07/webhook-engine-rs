@@ -1,4 +1,4 @@
-use webhook_engine::{api, config::AppConfig, db};
+use webhook_engine::{api, config::AppConfig, db, delivery_worker};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -14,6 +14,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = AppConfig::from_env()?;
     let pool = db::connect(&config).await?;
     db::run_schema_bootstrap(&pool).await?;
+
+    delivery_worker::spawn(pool.clone(), delivery_worker::WorkerConfig::from_env());
 
     let app = api::router(api::AppState { pool });
     let listener = tokio::net::TcpListener::bind(config.bind_addr).await?;
