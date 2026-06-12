@@ -116,17 +116,20 @@ pub struct EventListItem {
 pub struct DeliveryListItem {
     pub delivery_id: i64,
     pub event_id: i64,
+    pub event_type: String,
     pub merchant_id: i64,
     pub endpoint_id: i64,
     pub endpoint_url: String,
     pub status: String,
+    pub attempt_count: i64,
     pub max_attempts: i64,
-    pub next_attempt_at: Option<DateTime<Utc>>,
+    pub last_http_status: Option<i16>,
+    pub last_outcome: Option<String>,
+    pub duration_ms: Option<i64>,
     pub last_error: Option<String>,
+    pub next_attempt_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
-    pub final_state_at: Option<DateTime<Utc>>,
-    pub attempt_count: i64,
 }
 
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
@@ -204,7 +207,11 @@ pub struct DeliveryListQuery {
     pub merchant_id: Option<i64>,
     pub endpoint_id: Option<i64>,
     pub event_id: Option<i64>,
+    pub event_type: Option<String>,
+    pub endpoint: Option<String>,
     pub status: Option<String>,
+    pub search: Option<String>,
+    pub time_range: Option<String>,
     pub cursor: Option<i64>,
     pub limit: Option<i64>,
 }
@@ -230,6 +237,25 @@ pub struct DashboardSummary {
     pub enabled_endpoints: i64,
     pub attempts_24h: i64,
     pub failed_attempts_24h: i64,
+    pub success_rate: Option<f64>,
+    pub active_deliveries: i64,
+    pub queued_count: i64,
+    pub processing_count: i64,
+    pub retrying_count: i64,
+    pub dead_letter_count: i64,
+    pub queue_depth: i64,
+    pub redis_pending: Option<i64>,
+    pub p95_latency_ms: Option<f64>,
+    pub active_workers: Option<i64>,
+    pub retry_backlog: RetryBacklogSummary,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RetryBacklogSummary {
+    pub due_now: i64,
+    pub due_0_to_5_min: i64,
+    pub due_5_to_15_min: i64,
+    pub due_15_min_plus: i64,
 }
 
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]

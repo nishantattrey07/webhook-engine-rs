@@ -147,8 +147,9 @@ async fn get_event_fanout(
 
 async fn list_deliveries(
     State(state): State<AppState>,
+    Query(query): Query<crate::models::DeliveryListQuery>,
 ) -> AppResult<Json<Vec<crate::models::DeliveryListItem>>> {
-    let deliveries = services::list_deliveries(&state.pool).await?;
+    let deliveries = services::list_deliveries(&state.pool, query).await?;
     Ok(Json(deliveries))
 }
 
