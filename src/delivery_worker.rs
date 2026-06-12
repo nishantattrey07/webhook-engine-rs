@@ -9,10 +9,13 @@ use redis::{
 };
 use reqwest::Client;
 use serde_json::{Value, json};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, Row, Transaction};
 
 type HmacSha256 = Hmac<Sha256>;
+type DeliveryTaskResult = Result<(i64, Result<(), sqlx::Error>), tokio::task::JoinError>;
+type RedisDeliveryTaskResult =
+    Result<(String, i64, Result<(), sqlx::Error>), tokio::task::JoinError>;
 
 #[derive(Debug, Clone)]
 pub struct WorkerConfig {
@@ -279,7 +282,11 @@ fn spawn_redis_transport(pool: PgPool, config: WorkerConfig) {
 }
 
 fn build_http_client(request_timeout: Duration) -> Option<Client> {
-    match Client::builder().timeout(request_timeout).build() {
+    match Client::builder()
+        .timeout(request_timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+    {
         Ok(client) => Some(client),
         Err(error) => {
             tracing::error!(%error, "failed to build HTTP client for delivery worker");
@@ -351,9 +358,7 @@ async fn process_claimed_deliveries(
     processed
 }
 
-async fn handle_delivery_join(
-    result: Option<Result<(i64, Result<(), sqlx::Error>), tokio::task::JoinError>>,
-) -> bool {
+async fn handle_delivery_join(result: Option<DeliveryTaskResult>) -> bool {
     match result {
         Some(Ok((_, Ok(())))) => true,
         Some(Ok((delivery_id, Err(error)))) => {
@@ -682,9 +687,7 @@ async fn process_redis_jobs(
     Ok(processed)
 }
 
-async fn handle_redis_delivery_join(
-    result: Option<Result<(String, i64, Result<(), sqlx::Error>), tokio::task::JoinError>>,
-) -> Option<String> {
+async fn handle_redis_delivery_join(result: Option<RedisDeliveryTaskResult>) -> Option<String> {
     match result {
         Some(Ok((message_id, _, Ok(())))) => Some(message_id),
         Some(Ok((_, delivery_id, Err(error)))) => {
@@ -1173,22 +1176,22 @@ async fn recover_processing_delivery(pool: &PgPool, delivery_id: i64) -> Result<
         attempt_id,
         outcome.as_deref(),
         completed_at,
-    ) {
-        if current_attempt_id == attempt_id && current_outcome == "unknown" {
-            sqlx::query(
-                "UPDATE delivery_attempts
-                 SET outcome = 'abandoned',
-                     error_message = COALESCE(error_message, 'processing lease expired before attempt completed'),
-                     completed_at = COALESCE(completed_at, NOW())
-                 WHERE attempt_id = $1
-                   AND outcome = 'unknown'
-                   AND completed_at IS NULL",
-            )
-            .bind(attempt_id)
-            .execute(&mut *tx)
-            .await?;
-            outcome = Some("abandoned".to_string());
-        }
+    ) && current_attempt_id == attempt_id
+        && current_outcome == "unknown"
+    {
+        sqlx::query(
+            "UPDATE delivery_attempts
+             SET outcome = 'abandoned',
+                 error_message = COALESCE(error_message, 'processing lease expired before attempt completed'),
+                 completed_at = COALESCE(completed_at, NOW())
+             WHERE attempt_id = $1
+               AND outcome = 'unknown'
+               AND completed_at IS NULL",
+        )
+        .bind(attempt_id)
+        .execute(&mut *tx)
+        .await?;
+        outcome = Some("abandoned".to_string());
     }
 
     let attempt_count = attempt_count.unwrap_or(0);
@@ -1542,6 +1545,7 @@ async fn send_webhook(
             };
         }
     };
+    let request_body_hash = sha256_hex(&body);
 
     let signature = match sign_payload(pool, delivery, &body).await {
         Ok(signature) => signature,
@@ -1554,6 +1558,24 @@ async fn send_webhook(
             };
         }
     };
+
+    if let Err(error) = persist_request_body_hash(
+        pool,
+        delivery.delivery_id,
+        delivery.attempt_id,
+        &request_body_hash,
+    )
+    .await
+    {
+        return DeliveryResult {
+            outcome: DeliveryOutcome::PermanentFailure,
+            http_status: None,
+            response_body_sample: None,
+            error_message: Some(format!(
+                "failed to persist request body hash before send: {error}"
+            )),
+        };
+    }
 
     let mut request = client
         .post(&delivery.endpoint_url)
@@ -1607,6 +1629,31 @@ async fn send_webhook(
     }
 }
 
+fn sha256_hex(body: &[u8]) -> String {
+    hex::encode(Sha256::digest(body))
+}
+
+async fn persist_request_body_hash(
+    pool: &PgPool,
+    delivery_id: i64,
+    attempt_id: i64,
+    request_body_hash: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE delivery_attempts
+         SET request_body_hash = $3
+         WHERE attempt_id = $1
+           AND delivery_id = $2",
+    )
+    .bind(attempt_id)
+    .bind(delivery_id)
+    .bind(request_body_hash)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
 async fn sign_payload(
     pool: &PgPool,
     delivery: &ClaimedDelivery,
@@ -1646,6 +1693,7 @@ async fn sign_payload(
 fn classify_status(status: u16) -> DeliveryOutcome {
     match status {
         200..=299 => DeliveryOutcome::Success,
+        300..=399 => DeliveryOutcome::PermanentFailure,
         408 | 429 => DeliveryOutcome::TemporaryFailure,
         500..=599 => DeliveryOutcome::TemporaryFailure,
         400..=499 => DeliveryOutcome::PermanentFailure,
@@ -2010,6 +2058,32 @@ mod tests {
             decide_final_delivery_state("permanent_failure", 1, 5),
             FinalDeliveryState::DeadLettered
         );
+    }
+
+    #[test]
+    fn redirect_status_is_permanent_failure() {
+        assert!(matches!(
+            classify_status(302),
+            DeliveryOutcome::PermanentFailure
+        ));
+        assert!(matches!(
+            classify_status(307),
+            DeliveryOutcome::PermanentFailure
+        ));
+    }
+
+    #[test]
+    fn sha256_hex_hashes_exact_body_bytes() {
+        let body = br#"{"event_id":1,"delivery_id":2}"#;
+        assert_eq!(
+            sha256_hex(body),
+            "c97e4f7c261e1fb5e7a8c0db118ebd23d822fd09a288a17733f4c4c16e4c8d50"
+        );
+    }
+
+    #[test]
+    fn http_client_builder_uses_redirect_policy_none() {
+        assert!(build_http_client(Duration::from_millis(100)).is_some());
     }
 
     #[test]

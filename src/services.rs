@@ -1,4 +1,7 @@
-use std::time::Duration;
+use std::{
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    time::Duration,
+};
 
 use chrono::{DateTime, Utc};
 use serde_json::json;
@@ -70,7 +73,7 @@ fn normalize_search(value: Option<&str>) -> Option<String> {
 fn normalize_exact_filter(value: Option<String>) -> Option<String> {
     value
         .map(|value| value.trim().to_ascii_lowercase())
-        .filter(|value| !value.is_empty() && value.to_ascii_lowercase() != "all")
+        .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("all"))
 }
 
 fn endpoint_search(value: Option<&str>) -> EndpointSearch {
@@ -208,9 +211,7 @@ async fn redis_pending_from_runtime() -> Option<i64> {
         return None;
     }
 
-    let Some(redis_url) = config.redis_url.as_deref() else {
-        return None;
-    };
+    let redis_url = config.redis_url.as_deref()?;
 
     let pending = redis_pending(
         redis_url,
@@ -656,6 +657,10 @@ pub async fn create_bulk_payments(
 }
 
 fn validate_endpoint_url(url: &str) -> AppResult<()> {
+    validate_endpoint_url_with_local_policy(url, allow_local_webhook_targets())
+}
+
+fn validate_endpoint_url_with_local_policy(url: &str, allow_local_targets: bool) -> AppResult<()> {
     let parsed = Url::parse(url.trim())
         .map_err(|_| AppError::BadRequest("endpoint URL must be a valid URL".to_string()))?;
 
@@ -674,7 +679,61 @@ fn validate_endpoint_url(url: &str) -> AppResult<()> {
         ));
     }
 
+    if !allow_local_targets && is_blocked_webhook_host(parsed.host_str().unwrap_or_default()) {
+        return Err(AppError::BadRequest(
+            "endpoint URL targets localhost, private, link-local, multicast, metadata, or unspecified addresses; set ALLOW_LOCAL_WEBHOOK_TARGETS=1 for local demo targets".to_string(),
+        ));
+    }
+
     Ok(())
+}
+
+fn allow_local_webhook_targets() -> bool {
+    std::env::var("ALLOW_LOCAL_WEBHOOK_TARGETS")
+        .map(|value| value == "1")
+        .unwrap_or(false)
+}
+
+fn is_blocked_webhook_host(host: &str) -> bool {
+    let host = host.trim().trim_matches(['[', ']']).to_ascii_lowercase();
+
+    if matches!(
+        host.as_str(),
+        "localhost" | "metadata" | "metadata.google.internal"
+    ) {
+        return true;
+    }
+
+    match host.parse::<IpAddr>() {
+        Ok(IpAddr::V4(addr)) => is_blocked_ipv4(addr),
+        Ok(IpAddr::V6(addr)) => is_blocked_ipv6(addr),
+        Err(_) => false,
+    }
+}
+
+fn is_blocked_ipv4(addr: Ipv4Addr) -> bool {
+    addr.is_loopback()
+        || addr.is_private()
+        || addr.is_link_local()
+        || addr.is_multicast()
+        || addr.is_unspecified()
+        || addr == Ipv4Addr::new(169, 254, 169, 254)
+}
+
+fn is_blocked_ipv6(addr: Ipv6Addr) -> bool {
+    addr.is_loopback()
+        || addr.is_multicast()
+        || addr.is_unspecified()
+        || is_ipv6_unique_local(addr)
+        || is_ipv6_unicast_link_local(addr)
+}
+
+fn is_ipv6_unique_local(addr: Ipv6Addr) -> bool {
+    (addr.segments()[0] & 0xfe00) == 0xfc00
+}
+
+fn is_ipv6_unicast_link_local(addr: Ipv6Addr) -> bool {
+    (addr.segments()[0] & 0xffc0) == 0xfe80
 }
 
 fn validate_max_attempts(max_attempts: Option<i64>) -> AppResult<i64> {
@@ -890,8 +949,14 @@ pub async fn get_dashboard_summary(pool: &PgPool) -> AppResult<DashboardSummary>
             (
                 SELECT COUNT(*)::BIGINT
                 FROM webhook_deliveries
-                WHERE status IN ('pending', 'queued', 'processing', 'retrying')
+                WHERE status IN ('queued', 'processing', 'retrying')
             ) AS active_deliveries,
+            (
+                SELECT COUNT(*)::BIGINT
+                FROM webhook_deliveries
+                WHERE status = 'pending'
+                  AND (next_attempt_at IS NULL OR next_attempt_at <= NOW())
+            ) AS pending_due_now,
             (
                 SELECT COUNT(*)::BIGINT
                 FROM webhook_deliveries
@@ -934,6 +999,7 @@ pub async fn get_dashboard_summary(pool: &PgPool) -> AppResult<DashboardSummary>
     let processing_deliveries: i64 = row.get("processing_deliveries");
     let retrying_deliveries: i64 = row.get("retrying_deliveries");
     let dead_lettered_deliveries: i64 = row.get("dead_lettered_deliveries");
+    let pending_due_now: i64 = row.get("pending_due_now");
     let retry_due_now: i64 = row.get("retry_due_now");
 
     Ok(DashboardSummary {
@@ -954,12 +1020,16 @@ pub async fn get_dashboard_summary(pool: &PgPool) -> AppResult<DashboardSummary>
         } else {
             None
         },
-        active_deliveries: row.get("active_deliveries"),
+        active_deliveries: active_deliveries(
+            queued_deliveries,
+            processing_deliveries,
+            retrying_deliveries,
+        ),
         queued_count: queued_deliveries,
         processing_count: processing_deliveries,
         retrying_count: retrying_deliveries,
         dead_letter_count: dead_lettered_deliveries,
-        queue_depth: queued_deliveries + retry_due_now,
+        queue_depth: queue_depth(pending_due_now, queued_deliveries, retry_due_now),
         redis_pending,
         p95_latency_ms: row.get("p95_latency_ms"),
         // TODO: Replace with a real worker telemetry source, such as Redis heartbeat keys,
@@ -972,6 +1042,14 @@ pub async fn get_dashboard_summary(pool: &PgPool) -> AppResult<DashboardSummary>
             due_15_min_plus: row.get("retry_due_15_min_plus"),
         },
     })
+}
+
+fn queue_depth(pending_due_now: i64, queued: i64, retry_due_now: i64) -> i64 {
+    pending_due_now + queued + retry_due_now
+}
+
+fn active_deliveries(queued: i64, processing: i64, retrying: i64) -> i64 {
+    queued + processing + retrying
 }
 
 pub async fn list_deliveries(
@@ -1514,6 +1592,16 @@ pub async fn list_delivery_trace(
     pool: &PgPool,
     delivery_id: i64,
 ) -> AppResult<Vec<DeliveryTraceItem>> {
+    let event_id: i64 = sqlx::query_scalar(
+        "SELECT event_id
+         FROM webhook_deliveries
+         WHERE delivery_id = $1",
+    )
+    .bind(delivery_id)
+    .fetch_optional(pool)
+    .await?
+    .ok_or_else(|| AppError::NotFound(format!("delivery {} not found", delivery_id)))?;
+
     let rows = sqlx::query_as::<_, DeliveryTraceItem>(
         "SELECT
             trace_id,
@@ -1528,9 +1616,11 @@ pub async fn list_delivery_trace(
             duration_ms
          FROM delivery_trace_events
          WHERE delivery_id = $1
+            OR (delivery_id IS NULL AND event_id = $2)
          ORDER BY occurred_at ASC, trace_id ASC",
     )
     .bind(delivery_id)
+    .bind(event_id)
     .fetch_all(pool)
     .await?;
 
@@ -1542,6 +1632,10 @@ pub async fn get_delivery_trace_graph(
     delivery_id: i64,
 ) -> AppResult<TraceGraphResponse> {
     let trace = list_delivery_trace(pool, delivery_id).await?;
+    Ok(build_trace_graph(trace))
+}
+
+fn build_trace_graph(trace: Vec<DeliveryTraceItem>) -> TraceGraphResponse {
     let nodes = trace
         .iter()
         .map(|item| TraceGraphNode {
@@ -1563,5 +1657,300 @@ pub async fn get_delivery_trace_graph(
         })
         .collect::<Vec<_>>();
 
-    Ok(TraceGraphResponse { nodes, edges })
+    TraceGraphResponse { nodes, edges }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+    use serde_json::Value;
+    use sqlx::postgres::PgPoolOptions;
+
+    fn trace_item(
+        trace_id: i64,
+        delivery_id: Option<i64>,
+        event_id: i64,
+        step: &str,
+    ) -> DeliveryTraceItem {
+        DeliveryTraceItem {
+            trace_id,
+            delivery_id,
+            event_id,
+            step: step.to_string(),
+            status: "succeeded".to_string(),
+            title: step.to_string(),
+            detail: None,
+            metadata_json: Value::Object(Default::default()),
+            occurred_at: Utc
+                .with_ymd_and_hms(2026, 6, 12, 12, 0, trace_id as u32)
+                .single()
+                .expect("valid test timestamp"),
+            duration_ms: None,
+        }
+    }
+
+    #[test]
+    fn trace_graph_uses_ordered_persisted_trace_rows() {
+        let graph = build_trace_graph(vec![
+            trace_item(1, None, 10, "payment_committed"),
+            trace_item(2, None, 10, "domain_event_created"),
+            trace_item(3, Some(20), 10, "delivery_created"),
+            trace_item(4, Some(20), 10, "worker_claimed"),
+        ]);
+
+        let steps = graph
+            .nodes
+            .iter()
+            .map(|node| node.step.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            steps,
+            vec![
+                "payment_committed",
+                "domain_event_created",
+                "delivery_created",
+                "worker_claimed"
+            ]
+        );
+        assert_eq!(graph.edges.len(), 3);
+        assert_eq!(graph.edges[0].source, "trace-1");
+        assert_eq!(graph.edges[0].target, "trace-2");
+    }
+
+    #[test]
+    fn dashboard_queue_depth_includes_pending_due_queued_and_retry_due() {
+        assert_eq!(queue_depth(2, 3, 5), 10);
+    }
+
+    #[test]
+    fn dashboard_active_deliveries_excludes_pending() {
+        assert_eq!(active_deliveries(3, 4, 5), 12);
+    }
+
+    #[test]
+    fn endpoint_url_rejects_local_targets_without_demo_allowance() {
+        for url in [
+            "http://localhost:3000/webhook",
+            "http://127.0.0.1:3000/webhook",
+            "http://10.1.2.3/webhook",
+            "http://172.16.0.1/webhook",
+            "http://192.168.1.10/webhook",
+            "http://169.254.169.254/latest/meta-data",
+            "http://[::1]:3000/webhook",
+            "http://[fc00::1]/webhook",
+            "http://[fe80::1]/webhook",
+        ] {
+            assert!(
+                validate_endpoint_url_with_local_policy(url, false).is_err(),
+                "{url} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn endpoint_url_allows_local_targets_with_demo_allowance() {
+        for url in [
+            "http://localhost:3000/webhook",
+            "http://127.0.0.1:3000/webhook",
+            "http://10.1.2.3/webhook",
+            "http://[::1]:3000/webhook",
+        ] {
+            assert!(
+                validate_endpoint_url_with_local_policy(url, true).is_ok(),
+                "{url} should be allowed in local demo mode"
+            );
+        }
+    }
+
+    #[test]
+    fn endpoint_url_allows_public_https_targets_without_demo_allowance() {
+        assert!(
+            validate_endpoint_url_with_local_policy("https://example.com/webhook", false).is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn list_delivery_trace_includes_event_rows_and_only_this_delivery_rows_when_test_db_is_set()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let database_url = match std::env::var("TEST_DATABASE_URL") {
+            Ok(value) => value,
+            Err(_) => {
+                eprintln!("skipping db-backed trace test; TEST_DATABASE_URL is not set");
+                return Ok(());
+            }
+        };
+
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await?;
+
+        let marker = Utc::now().timestamp_micros();
+        let merchant_id = 9_000_000_000_i64 + (marker % 1_000_000);
+        let payment_id: i64 = sqlx::query_scalar(
+            "INSERT INTO payments (merchant_id, order_id, amount, status, mode_of_payment)
+             VALUES ($1, $2, 100, 'succeeded', 'test')
+             RETURNING payment_id",
+        )
+        .bind(merchant_id)
+        .bind(marker)
+        .fetch_one(&pool)
+        .await?;
+
+        let event_id: i64 = sqlx::query_scalar(
+            "INSERT INTO domain_events (
+                merchant_id,
+                object_type,
+                object_id,
+                event_type,
+                event_snapshot_json
+             )
+             VALUES ($1, 'payment', $2, 'payment_succeeded', '{}'::jsonb)
+             RETURNING event_id",
+        )
+        .bind(merchant_id)
+        .bind(payment_id)
+        .fetch_one(&pool)
+        .await?;
+
+        let endpoint_one_id: i64 = sqlx::query_scalar(
+            "INSERT INTO webhook_endpoints (merchant_id, url, enabled, max_attempts)
+             VALUES ($1, 'http://127.0.0.1:3000/test/one', TRUE, 5)
+             RETURNING endpoint_id",
+        )
+        .bind(merchant_id)
+        .fetch_one(&pool)
+        .await?;
+
+        let endpoint_two_id: i64 = sqlx::query_scalar(
+            "INSERT INTO webhook_endpoints (merchant_id, url, enabled, max_attempts)
+             VALUES ($1, 'http://127.0.0.1:3000/test/two', TRUE, 5)
+             RETURNING endpoint_id",
+        )
+        .bind(merchant_id)
+        .fetch_one(&pool)
+        .await?;
+
+        let delivery_one_id: i64 = sqlx::query_scalar(
+            "INSERT INTO webhook_deliveries (
+                event_id,
+                endpoint_id,
+                merchant_id,
+                endpoint_url,
+                status,
+                max_attempts
+             )
+             VALUES ($1, $2, $3, 'http://127.0.0.1:3000/test/one', 'pending', 5)
+             RETURNING delivery_id",
+        )
+        .bind(event_id)
+        .bind(endpoint_one_id)
+        .bind(merchant_id)
+        .fetch_one(&pool)
+        .await?;
+
+        let delivery_two_id: i64 = sqlx::query_scalar(
+            "INSERT INTO webhook_deliveries (
+                event_id,
+                endpoint_id,
+                merchant_id,
+                endpoint_url,
+                status,
+                max_attempts
+             )
+             VALUES ($1, $2, $3, 'http://127.0.0.1:3000/test/two', 'pending', 5)
+             RETURNING delivery_id",
+        )
+        .bind(event_id)
+        .bind(endpoint_two_id)
+        .bind(merchant_id)
+        .fetch_one(&pool)
+        .await?;
+
+        let occurred_at = Utc::now();
+        for (delivery_id, step) in [
+            (None, "payment_committed"),
+            (None, "domain_event_created"),
+            (Some(delivery_one_id), "delivery_one_created"),
+            (Some(delivery_two_id), "delivery_two_created"),
+        ] {
+            sqlx::query(
+                "INSERT INTO delivery_trace_events (
+                    delivery_id,
+                    event_id,
+                    step,
+                    status,
+                    title,
+                    metadata_json,
+                    occurred_at
+                 )
+                 VALUES ($1, $2, $3, 'succeeded', $3, '{}'::jsonb, $4)",
+            )
+            .bind(delivery_id)
+            .bind(event_id)
+            .bind(step)
+            .bind(occurred_at)
+            .execute(&pool)
+            .await?;
+        }
+
+        let delivery_one_trace = list_delivery_trace(&pool, delivery_one_id).await?;
+        let delivery_one_steps = delivery_one_trace
+            .iter()
+            .map(|item| item.step.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            delivery_one_steps,
+            vec![
+                "payment_committed",
+                "domain_event_created",
+                "delivery_one_created"
+            ]
+        );
+        assert!(
+            delivery_one_trace
+                .iter()
+                .any(|item| item.delivery_id.is_none())
+        );
+        assert!(
+            delivery_one_trace
+                .iter()
+                .all(|item| item.delivery_id.is_none() || item.delivery_id == Some(delivery_one_id))
+        );
+
+        let delivery_two_trace = list_delivery_trace(&pool, delivery_two_id).await?;
+        let delivery_two_steps = delivery_two_trace
+            .iter()
+            .map(|item| item.step.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            delivery_two_steps,
+            vec![
+                "payment_committed",
+                "domain_event_created",
+                "delivery_two_created"
+            ]
+        );
+
+        let graph = get_delivery_trace_graph(&pool, delivery_one_id).await?;
+        let graph_steps = graph
+            .nodes
+            .iter()
+            .map(|node| node.step.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(graph_steps, delivery_one_steps);
+
+        sqlx::query("DELETE FROM payments WHERE payment_id = $1")
+            .bind(payment_id)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM webhook_endpoints WHERE merchant_id = $1")
+            .bind(merchant_id)
+            .execute(&pool)
+            .await?;
+
+        Ok(())
+    }
 }
