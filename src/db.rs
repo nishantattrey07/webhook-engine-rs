@@ -16,18 +16,23 @@ pub async fn connect(config: &AppConfig) -> AppResult<PgPool> {
 }
 
 pub async fn run_schema_bootstrap(pool: &PgPool) -> AppResult<()> {
-    let schema = include_str!("../migrations/001_phase1_schema.sql");
+    let schemas = [
+        include_str!("../migrations/001_phase1_schema.sql"),
+        include_str!("../migrations/002_delivery_search_indexes.sql"),
+    ];
 
-    for statement in split_sql_statements(schema) {
-        let preview = statement_preview(&statement);
-        tracing::debug!("running schema statement: {}", preview);
+    for schema in schemas {
+        for statement in split_sql_statements(schema) {
+            let preview = statement_preview(&statement);
+            tracing::debug!("running schema statement: {}", preview);
 
-        timeout(
-            Duration::from_secs(10),
-            sqlx::query(&statement).execute(pool),
-        )
-        .await
-        .map_err(|_| AppError::SchemaBootstrapTimeout(preview))??;
+            timeout(
+                Duration::from_secs(10),
+                sqlx::query(&statement).execute(pool),
+            )
+            .await
+            .map_err(|_| AppError::SchemaBootstrapTimeout(preview))??;
+        }
     }
 
     Ok(())

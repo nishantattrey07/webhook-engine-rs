@@ -10,7 +10,7 @@ use redis::{
 use reqwest::Client;
 use serde_json::{Value, json};
 use sha2::Sha256;
-use sqlx::{PgPool, Row};
+use sqlx::{PgPool, Postgres, Row, Transaction};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -130,6 +130,20 @@ struct ClaimedDelivery {
     endpoint_url: String,
     secret_version_id: Option<i64>,
     max_attempts: i64,
+    attempt_id: i64,
+    attempt_count: i64,
+    processing_lease_token: String,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct ClaimableDelivery {
+    delivery_id: i64,
+    event_id: i64,
+    endpoint_id: i64,
+    merchant_id: i64,
+    endpoint_url: String,
+    secret_version_id: Option<i64>,
+    max_attempts: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -146,9 +160,16 @@ struct RedisDeliveryJob {
 }
 
 #[derive(Debug, Clone)]
-struct AttemptStart {
-    attempt_id: i64,
-    attempt_count: i64,
+struct QueuedDelivery {
+    delivery_id: i64,
+    queue_token: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FinalDeliveryState {
+    Delivered,
+    Retrying,
+    DeadLettered,
 }
 
 #[derive(Debug, Clone)]
@@ -177,13 +198,6 @@ impl DeliveryOutcome {
             Self::Timeout => Some("request timed out".to_string()),
             _ => None,
         }
-    }
-
-    fn is_retryable(&self) -> bool {
-        matches!(
-            self,
-            Self::TemporaryFailure | Self::Timeout | Self::NetworkError(_)
-        )
     }
 }
 
@@ -230,7 +244,16 @@ fn spawn_postgres_worker(pool: PgPool, config: WorkerConfig) {
         );
 
         loop {
-            match run_postgres_once(&pool, &client, config.batch_size, config.concurrency).await {
+            match run_postgres_once(
+                &pool,
+                &client,
+                config.batch_size,
+                config.concurrency,
+                config.request_timeout,
+                &config.redis_consumer_name,
+            )
+            .await
+            {
                 Ok(processed) if processed > 0 => {
                     tracing::debug!(processed, "processed delivery batch");
                 }
@@ -265,15 +288,27 @@ fn build_http_client(request_timeout: Duration) -> Option<Client> {
     }
 }
 
+fn processing_lease_duration(request_timeout: Duration) -> chrono::Duration {
+    let millis = request_timeout
+        .saturating_add(Duration::from_secs(30))
+        .as_millis()
+        .min(i64::MAX as u128) as i64;
+
+    chrono::Duration::milliseconds(millis)
+}
+
 async fn run_postgres_once(
     pool: &PgPool,
     client: &Client,
     batch_size: i64,
     concurrency: usize,
+    request_timeout: Duration,
+    worker_id: &str,
 ) -> Result<usize, sqlx::Error> {
     recover_stuck_processing(pool).await?;
 
-    let deliveries = claim_due_deliveries(pool, batch_size).await?;
+    let lease_duration = processing_lease_duration(request_timeout);
+    let deliveries = claim_due_deliveries(pool, batch_size, lease_duration, worker_id).await?;
     let count = deliveries.len();
 
     process_claimed_deliveries(pool, client, deliveries, concurrency).await;
@@ -459,21 +494,22 @@ async fn run_redis_relay_once(
     recover_stuck_processing(pool).await?;
     recover_stale_queued(pool).await?;
 
-    let delivery_ids = claim_due_deliveries_for_queue(pool, config.batch_size).await?;
-    let count = delivery_ids.len();
+    let queued_deliveries = claim_due_deliveries_for_queue(pool, config.batch_size).await?;
+    let count = queued_deliveries.len();
     let mut failures = 0;
 
-    for delivery_id in delivery_ids {
-        match publish_delivery(redis, &config.redis_stream, delivery_id).await {
+    for queued_delivery in queued_deliveries {
+        match publish_delivery(redis, &config.redis_stream, &queued_delivery).await {
             Ok(message_id) => {
-                mark_delivery_published(pool, delivery_id, &message_id).await?;
+                mark_delivery_published(pool, &queued_delivery, &message_id).await?;
             }
             Err(error) => {
-                mark_delivery_publish_failed(pool, delivery_id, &error.to_string()).await?;
+                mark_delivery_publish_failed(pool, &queued_delivery, &error.to_string()).await?;
                 failures += 1;
                 tracing::error!(
                     %error,
-                    delivery_id,
+                    delivery_id = queued_delivery.delivery_id,
+                    queue_token = %queued_delivery.queue_token,
                     "failed to publish delivery to Redis stream"
                 );
             }
@@ -542,12 +578,47 @@ async fn claim_redis_message(
         return Ok(None);
     };
 
-    match claim_queued_delivery(pool, delivery_id).await? {
+    let Some(queue_token) = stream_id
+        .map
+        .get("queue_token")
+        .and_then(redis_value_to_uuid_text)
+    else {
+        tracing::warn!(
+            message_id = stream_id.id,
+            delivery_id,
+            "Redis delivery message missing invalid queue_token; acking without processing"
+        );
+        ack_message(
+            redis,
+            &config.redis_stream,
+            &config.redis_consumer_group,
+            &stream_id.id,
+        )
+        .await?;
+        return Ok(None);
+    };
+
+    let lease_duration = processing_lease_duration(config.request_timeout);
+    match claim_queued_delivery(
+        pool,
+        delivery_id,
+        &queue_token,
+        lease_duration,
+        &config.redis_consumer_name,
+    )
+    .await?
+    {
         Some(delivery) => Ok(Some(RedisDeliveryJob {
             message_id: stream_id.id,
             delivery,
         })),
         None => {
+            tracing::warn!(
+                message_id = stream_id.id,
+                delivery_id,
+                queue_token,
+                "Redis delivery message skipped because delivery is missing, terminal, already claimed, or queue token is stale"
+            );
             ack_message(
                 redis,
                 &config.redis_stream,
@@ -659,7 +730,7 @@ async fn reclaim_pending_messages(
 async fn claim_due_deliveries_for_queue(
     pool: &PgPool,
     batch_size: i64,
-) -> Result<Vec<i64>, sqlx::Error> {
+) -> Result<Vec<QueuedDelivery>, sqlx::Error> {
     let rows = sqlx::query(
         "WITH due AS (
             SELECT delivery_id
@@ -673,27 +744,43 @@ async fn claim_due_deliveries_for_queue(
          UPDATE webhook_deliveries d
          SET status = 'queued',
              queued_at = NOW(),
+             queue_token = gen_random_uuid(),
              queue_attempt_count = queue_attempt_count + 1,
              last_queue_error = NULL,
+             published_at = NULL,
+             redis_message_id = NULL,
              updated_at = NOW()
          FROM due
          WHERE d.delivery_id = due.delivery_id
-         RETURNING d.delivery_id",
+         RETURNING d.delivery_id, d.queue_token::TEXT AS queue_token",
     )
     .bind(batch_size)
     .fetch_all(pool)
     .await?;
 
-    Ok(rows.into_iter().map(|row| row.get("delivery_id")).collect())
+    Ok(rows
+        .into_iter()
+        .map(|row| QueuedDelivery {
+            delivery_id: row.get("delivery_id"),
+            queue_token: row.get("queue_token"),
+        })
+        .collect())
 }
 
 async fn publish_delivery(
     redis: &mut ConnectionManager,
     stream: &str,
-    delivery_id: i64,
+    delivery: &QueuedDelivery,
 ) -> redis::RedisResult<String> {
     redis
-        .xadd(stream, "*", &[("delivery_id", delivery_id)])
+        .xadd(
+            stream,
+            "*",
+            &[
+                ("delivery_id", delivery.delivery_id.to_string()),
+                ("queue_token", delivery.queue_token.clone()),
+            ],
+        )
         .await
 }
 
@@ -718,28 +805,43 @@ async fn trim_redis_stream_if_configured(
 
 async fn mark_delivery_published(
     pool: &PgPool,
-    delivery_id: i64,
+    delivery: &QueuedDelivery,
     message_id: &str,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(
+    let row = sqlx::query(
         "UPDATE webhook_deliveries
          SET published_at = NOW(),
              redis_message_id = $2,
              updated_at = NOW()
-         WHERE delivery_id = $1",
+         WHERE delivery_id = $1
+           AND status IN ('queued', 'processing')
+           AND queue_token = $3::uuid
+         RETURNING event_id",
     )
-    .bind(delivery_id)
+    .bind(delivery.delivery_id)
     .bind(message_id)
-    .execute(pool)
+    .bind(&delivery.queue_token)
+    .fetch_optional(pool)
     .await?;
 
-    append_delivery_trace_by_id(
+    let Some(row) = row else {
+        tracing::warn!(
+            delivery_id = delivery.delivery_id,
+            queue_token = %delivery.queue_token,
+            redis_message_id = message_id,
+            "stale Redis publish success ignored because queue generation no longer matches"
+        );
+        return Ok(());
+    };
+
+    append_trace(
         pool,
-        delivery_id,
+        delivery.delivery_id,
+        row.get("event_id"),
         "queued_to_redis",
         "succeeded",
         "Delivery queued to Redis",
-        json!({ "redis_message_id": message_id }),
+        json!({ "redis_message_id": message_id, "queue_token": delivery.queue_token.clone() }),
     )
     .await?;
 
@@ -748,31 +850,77 @@ async fn mark_delivery_published(
 
 async fn mark_delivery_publish_failed(
     pool: &PgPool,
-    delivery_id: i64,
+    delivery: &QueuedDelivery,
     error: &str,
 ) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let Some(row) = sqlx::query(
+        "SELECT event_id, queue_attempt_count
+         FROM webhook_deliveries
+         WHERE delivery_id = $1
+           AND status = 'queued'
+           AND queue_token = $2::uuid
+         FOR UPDATE",
+    )
+    .bind(delivery.delivery_id)
+    .bind(&delivery.queue_token)
+    .fetch_optional(&mut *tx)
+    .await?
+    else {
+        tx.commit().await?;
+        tracing::warn!(
+            delivery_id = delivery.delivery_id,
+            queue_token = %delivery.queue_token,
+            "stale Redis publish failure ignored because queue generation no longer matches"
+        );
+        return Ok(());
+    };
+
+    let event_id: i64 = row.get("event_id");
+    let queue_attempt_count: i64 = row.get("queue_attempt_count");
+    let backoff = queue_publish_backoff(queue_attempt_count);
+    let next_attempt_at = Utc::now() + backoff;
+    let error = error.chars().take(1000).collect::<String>();
+
     sqlx::query(
         "UPDATE webhook_deliveries
          SET status = 'retrying',
-             next_attempt_at = NOW(),
-             last_queue_error = $2,
+             next_attempt_at = $3,
+             last_queue_error = $4,
+             queued_at = NULL,
+             queue_token = NULL,
+             published_at = NULL,
+             redis_message_id = NULL,
              updated_at = NOW()
-         WHERE delivery_id = $1",
+         WHERE delivery_id = $1
+           AND status = 'queued'
+           AND queue_token = $2::uuid",
     )
-    .bind(delivery_id)
-    .bind(error.chars().take(1000).collect::<String>())
-    .execute(pool)
+    .bind(delivery.delivery_id)
+    .bind(&delivery.queue_token)
+    .bind(next_attempt_at)
+    .bind(&error)
+    .execute(&mut *tx)
     .await?;
 
-    append_delivery_trace_by_id(
-        pool,
-        delivery_id,
+    append_trace_in_tx(
+        &mut tx,
+        delivery.delivery_id,
+        event_id,
         "redis_publish_failed",
         "retrying",
         "Redis publish failed",
-        json!({ "error": error.chars().take(1000).collect::<String>() }),
+        json!({
+            "error": error,
+            "queue_token": delivery.queue_token.clone(),
+            "queue_attempt": queue_attempt_count,
+            "next_attempt_at": next_attempt_at,
+            "backoff_ms": backoff.num_milliseconds()
+        }),
     )
     .await?;
+
+    tx.commit().await?;
 
     Ok(())
 }
@@ -818,27 +966,39 @@ async fn autoclaim_pending_messages(
 async fn claim_queued_delivery(
     pool: &PgPool,
     delivery_id: i64,
+    queue_token: &str,
+    lease_duration: chrono::Duration,
+    worker_id: &str,
 ) -> Result<Option<ClaimedDelivery>, sqlx::Error> {
-    sqlx::query_as::<_, ClaimedDelivery>(
-        "UPDATE webhook_deliveries d
-         SET status = 'processing',
-             first_attempt_at = COALESCE(first_attempt_at, NOW()),
-             processing_started_at = NOW(),
-             updated_at = NOW()
-         WHERE d.delivery_id = $1
-           AND d.status = 'queued'
-         RETURNING
-             d.delivery_id,
-             d.event_id,
-             d.endpoint_id,
-             d.merchant_id,
-             d.endpoint_url,
-             d.secret_version_id,
-             d.max_attempts",
+    let mut tx = pool.begin().await?;
+    let Some(delivery) = sqlx::query_as::<_, ClaimableDelivery>(
+        "SELECT
+             delivery_id,
+             event_id,
+             endpoint_id,
+             merchant_id,
+             endpoint_url,
+             secret_version_id,
+             max_attempts
+         FROM webhook_deliveries
+         WHERE delivery_id = $1
+           AND status = 'queued'
+           AND queue_token = $2::uuid
+         FOR UPDATE SKIP LOCKED",
     )
     .bind(delivery_id)
-    .fetch_optional(pool)
-    .await
+    .bind(queue_token)
+    .fetch_optional(&mut *tx)
+    .await?
+    else {
+        tx.commit().await?;
+        return Ok(None);
+    };
+
+    let claimed = claim_locked_delivery(&mut tx, delivery, lease_duration, worker_id).await?;
+    tx.commit().await?;
+
+    Ok(Some(claimed))
 }
 
 async fn ack_message(
@@ -860,12 +1020,51 @@ fn redis_value_to_i64(value: &redis::Value) -> Option<i64> {
     }
 }
 
+fn redis_value_to_uuid_text(value: &redis::Value) -> Option<String> {
+    let text = match value {
+        redis::Value::BulkString(bytes) => std::str::from_utf8(bytes).ok()?,
+        redis::Value::SimpleString(value) => value,
+        _ => return None,
+    };
+
+    if is_uuid_text(text) {
+        Some(text.to_ascii_lowercase())
+    } else {
+        None
+    }
+}
+
+fn is_uuid_text(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() != 36 {
+        return false;
+    }
+
+    for (index, byte) in bytes.iter().enumerate() {
+        match index {
+            8 | 13 | 18 | 23 => {
+                if *byte != b'-' {
+                    return false;
+                }
+            }
+            _ if !byte.is_ascii_hexdigit() => return false,
+            _ => {}
+        }
+    }
+
+    true
+}
+
 async fn recover_stale_queued(pool: &PgPool) -> Result<u64, sqlx::Error> {
     let rows = sqlx::query(
         "UPDATE webhook_deliveries
          SET status = 'retrying',
              next_attempt_at = NOW(),
              last_queue_error = COALESCE(last_queue_error, 'queued delivery was not claimed in time'),
+             queued_at = NULL,
+             queue_token = NULL,
+             published_at = NULL,
+             redis_message_id = NULL,
              updated_at = NOW()
          WHERE status = 'queued'
            AND queued_at < NOW() - INTERVAL '30 seconds'
@@ -899,88 +1098,325 @@ async fn recover_stale_queued(pool: &PgPool) -> Result<u64, sqlx::Error> {
 
 async fn recover_stuck_processing(pool: &PgPool) -> Result<u64, sqlx::Error> {
     let rows = sqlx::query(
-        "UPDATE webhook_deliveries
-         SET status = 'retrying',
-             next_attempt_at = NOW(),
-             last_error = COALESCE(last_error, 'processing lease expired before attempt completed'),
-             processing_started_at = NULL,
-             updated_at = NOW()
+        "SELECT delivery_id
+         FROM webhook_deliveries
          WHERE status = 'processing'
-           AND processing_started_at < NOW() - INTERVAL '30 seconds'
-         RETURNING delivery_id, event_id",
+           AND processing_lease_expires_at IS NOT NULL
+           AND processing_lease_expires_at <= NOW()
+         ORDER BY processing_lease_expires_at, delivery_id",
     )
     .fetch_all(pool)
     .await?;
 
-    for row in &rows {
+    let mut recovered = 0;
+    for row in rows {
         let delivery_id: i64 = row.get("delivery_id");
-        let event_id: i64 = row.get("event_id");
-
-        sqlx::query(
-            "UPDATE delivery_attempts
-             SET outcome = 'abandoned',
-                 error_message = COALESCE(error_message, 'processing lease expired before attempt completed'),
-                 completed_at = COALESCE(completed_at, NOW())
-             WHERE delivery_id = $1
-               AND outcome = 'unknown'
-               AND completed_at IS NULL",
-        )
-        .bind(delivery_id)
-        .execute(pool)
-        .await?;
-
-        append_trace(
-            pool,
-            delivery_id,
-            event_id,
-            "processing_recovered",
-            "retrying",
-            "Processing lease expired; delivery returned to retry queue",
-            json!({ "reason": "processing_timeout" }),
-        )
-        .await?;
+        if recover_processing_delivery(pool, delivery_id).await? {
+            recovered += 1;
+        }
     }
 
-    if !rows.is_empty() {
-        tracing::warn!(count = rows.len(), "recovered stuck processing deliveries");
+    if recovered > 0 {
+        tracing::warn!(count = recovered, "recovered expired processing deliveries");
     }
 
-    Ok(rows.len() as u64)
+    Ok(recovered)
+}
+
+async fn recover_processing_delivery(pool: &PgPool, delivery_id: i64) -> Result<bool, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let Some(row) = sqlx::query(
+        "SELECT
+             d.delivery_id,
+             d.event_id,
+             d.max_attempts,
+             d.current_attempt_id,
+             COALESCE(current_attempt.attempt_id, latest_attempt.attempt_id) AS attempt_id,
+             COALESCE(current_attempt.attempt_count, latest_attempt.attempt_count) AS attempt_count,
+             COALESCE(current_attempt.outcome, latest_attempt.outcome) AS outcome,
+             COALESCE(current_attempt.completed_at, latest_attempt.completed_at) AS completed_at
+         FROM webhook_deliveries d
+         LEFT JOIN delivery_attempts current_attempt
+            ON current_attempt.attempt_id = d.current_attempt_id
+         LEFT JOIN LATERAL (
+            SELECT attempt_id, attempt_count, outcome, completed_at
+            FROM delivery_attempts
+            WHERE delivery_id = d.delivery_id
+            ORDER BY attempt_count DESC, attempt_id DESC
+            LIMIT 1
+         ) latest_attempt
+            ON current_attempt.attempt_id IS NULL
+         WHERE d.delivery_id = $1
+           AND d.status = 'processing'
+           AND d.processing_lease_expires_at IS NOT NULL
+           AND d.processing_lease_expires_at <= NOW()
+         FOR UPDATE OF d",
+    )
+    .bind(delivery_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    else {
+        tx.commit().await?;
+        return Ok(false);
+    };
+
+    let event_id: i64 = row.get("event_id");
+    let max_attempts: i64 = row.get("max_attempts");
+    let current_attempt_id: Option<i64> = row.get("current_attempt_id");
+    let attempt_id: Option<i64> = row.get("attempt_id");
+    let attempt_count: Option<i64> = row.get("attempt_count");
+    let mut outcome: Option<String> = row.get("outcome");
+    let completed_at: Option<DateTime<Utc>> = row.get("completed_at");
+
+    if let (Some(current_attempt_id), Some(attempt_id), Some(current_outcome), None) = (
+        current_attempt_id,
+        attempt_id,
+        outcome.as_deref(),
+        completed_at,
+    ) {
+        if current_attempt_id == attempt_id && current_outcome == "unknown" {
+            sqlx::query(
+                "UPDATE delivery_attempts
+                 SET outcome = 'abandoned',
+                     error_message = COALESCE(error_message, 'processing lease expired before attempt completed'),
+                     completed_at = COALESCE(completed_at, NOW())
+                 WHERE attempt_id = $1
+                   AND outcome = 'unknown'
+                   AND completed_at IS NULL",
+            )
+            .bind(attempt_id)
+            .execute(&mut *tx)
+            .await?;
+            outcome = Some("abandoned".to_string());
+        }
+    }
+
+    let attempt_count = attempt_count.unwrap_or(0);
+    let outcome = outcome.as_deref().unwrap_or("unknown");
+    let final_state = decide_final_delivery_state(outcome, attempt_count, max_attempts);
+
+    match final_state {
+        FinalDeliveryState::Delivered => {
+            sqlx::query(
+                "UPDATE webhook_deliveries
+                 SET status = 'delivered',
+                     next_attempt_at = NULL,
+                     last_error = NULL,
+                     processing_started_at = NULL,
+                     processing_lease_token = NULL,
+                     processing_lease_expires_at = NULL,
+                     current_attempt_id = NULL,
+                     processing_worker_id = NULL,
+                     queue_token = NULL,
+                     final_state_at = NOW(),
+                     updated_at = NOW()
+                 WHERE delivery_id = $1",
+            )
+            .bind(delivery_id)
+            .execute(&mut *tx)
+            .await?;
+
+            append_trace_in_tx(
+                &mut tx,
+                delivery_id,
+                event_id,
+                "processing_recovered",
+                "succeeded",
+                "Recovered expired processing delivery as delivered",
+                json!({ "reason": "processing_lease_expired", "attempt": attempt_count }),
+            )
+            .await?;
+        }
+        FinalDeliveryState::Retrying => {
+            let next_attempt_at = Utc::now() + retry_delay(attempt_count.max(1));
+            sqlx::query(
+                "UPDATE webhook_deliveries
+                 SET status = 'retrying',
+                     next_attempt_at = $2,
+                     last_error = COALESCE(last_error, 'processing lease expired before attempt completed'),
+                     processing_started_at = NULL,
+                     processing_lease_token = NULL,
+                     processing_lease_expires_at = NULL,
+                     current_attempt_id = NULL,
+                     processing_worker_id = NULL,
+                     queued_at = NULL,
+                     queue_token = NULL,
+                     published_at = NULL,
+                     redis_message_id = NULL,
+                     updated_at = NOW()
+                 WHERE delivery_id = $1",
+            )
+            .bind(delivery_id)
+            .bind(next_attempt_at)
+            .execute(&mut *tx)
+            .await?;
+
+            append_trace_in_tx(
+                &mut tx,
+                delivery_id,
+                event_id,
+                "processing_recovered",
+                "retrying",
+                "Processing lease expired; delivery returned to retry queue",
+                json!({
+                    "reason": "processing_lease_expired",
+                    "attempt": attempt_count,
+                    "next_attempt_at": next_attempt_at
+                }),
+            )
+            .await?;
+        }
+        FinalDeliveryState::DeadLettered => {
+            sqlx::query(
+                "UPDATE webhook_deliveries
+                 SET status = 'dead_lettered',
+                     next_attempt_at = NULL,
+                     last_error = COALESCE(last_error, 'processing lease expired and attempts are exhausted'),
+                     processing_started_at = NULL,
+                     processing_lease_token = NULL,
+                     processing_lease_expires_at = NULL,
+                     current_attempt_id = NULL,
+                     processing_worker_id = NULL,
+                     queue_token = NULL,
+                     final_state_at = NOW(),
+                     updated_at = NOW()
+                 WHERE delivery_id = $1",
+            )
+            .bind(delivery_id)
+            .execute(&mut *tx)
+            .await?;
+
+            append_trace_in_tx(
+                &mut tx,
+                delivery_id,
+                event_id,
+                "processing_recovered",
+                "dead_lettered",
+                "Processing lease expired; delivery dead-lettered",
+                json!({
+                    "reason": "processing_lease_expired",
+                    "attempt": attempt_count,
+                    "outcome": outcome
+                }),
+            )
+            .await?;
+        }
+    }
+
+    tx.commit().await?;
+    Ok(true)
 }
 
 async fn claim_due_deliveries(
     pool: &PgPool,
     batch_size: i64,
+    lease_duration: chrono::Duration,
+    worker_id: &str,
 ) -> Result<Vec<ClaimedDelivery>, sqlx::Error> {
-    sqlx::query_as::<_, ClaimedDelivery>(
-        "WITH due AS (
-            SELECT delivery_id
-            FROM webhook_deliveries
-            WHERE status IN ('pending', 'retrying')
-              AND (next_attempt_at IS NULL OR next_attempt_at <= NOW())
-            ORDER BY created_at
-            LIMIT $1
-            FOR UPDATE SKIP LOCKED
+    let mut deliveries = Vec::new();
+
+    for _ in 0..batch_size {
+        let mut tx = pool.begin().await?;
+        let Some(delivery) = sqlx::query_as::<_, ClaimableDelivery>(
+            "SELECT
+                 delivery_id,
+                 event_id,
+                 endpoint_id,
+                 merchant_id,
+                 endpoint_url,
+                 secret_version_id,
+                 max_attempts
+             FROM webhook_deliveries
+             WHERE status IN ('pending', 'retrying')
+               AND (next_attempt_at IS NULL OR next_attempt_at <= NOW())
+             ORDER BY created_at
+             LIMIT 1
+             FOR UPDATE SKIP LOCKED",
+        )
+        .fetch_optional(&mut *tx)
+        .await?
+        else {
+            tx.commit().await?;
+            break;
+        };
+
+        let claimed = claim_locked_delivery(&mut tx, delivery, lease_duration, worker_id).await?;
+        tx.commit().await?;
+        deliveries.push(claimed);
+    }
+
+    Ok(deliveries)
+}
+
+async fn claim_locked_delivery(
+    tx: &mut Transaction<'_, Postgres>,
+    delivery: ClaimableDelivery,
+    lease_duration: chrono::Duration,
+    worker_id: &str,
+) -> Result<ClaimedDelivery, sqlx::Error> {
+    let lease_expires_at = Utc::now() + lease_duration;
+    let attempt = sqlx::query(
+        "INSERT INTO delivery_attempts (
+            delivery_id,
+            event_id,
+            endpoint_id,
+            attempt_count,
+            outcome,
+            started_at
          )
-         UPDATE webhook_deliveries d
+         SELECT
+            $1,
+            $2,
+            $3,
+            COALESCE(MAX(attempt_count), 0) + 1,
+            'unknown',
+            NOW()
+         FROM delivery_attempts
+         WHERE delivery_id = $1
+         RETURNING attempt_id, attempt_count",
+    )
+    .bind(delivery.delivery_id)
+    .bind(delivery.event_id)
+    .bind(delivery.endpoint_id)
+    .fetch_one(&mut **tx)
+    .await?;
+
+    let attempt_id: i64 = attempt.get("attempt_id");
+    let attempt_count: i64 = attempt.get("attempt_count");
+
+    let row = sqlx::query(
+        "UPDATE webhook_deliveries
          SET status = 'processing',
              first_attempt_at = COALESCE(first_attempt_at, NOW()),
              processing_started_at = NOW(),
+             processing_lease_token = gen_random_uuid(),
+             processing_lease_expires_at = $2,
+             current_attempt_id = $3,
+             processing_worker_id = $4,
              updated_at = NOW()
-         FROM due
-         WHERE d.delivery_id = due.delivery_id
-         RETURNING
-             d.delivery_id,
-             d.event_id,
-             d.endpoint_id,
-             d.merchant_id,
-             d.endpoint_url,
-             d.secret_version_id,
-             d.max_attempts",
+         WHERE delivery_id = $1
+           AND status IN ('pending', 'retrying', 'queued')
+         RETURNING processing_lease_token::TEXT AS processing_lease_token",
     )
-    .bind(batch_size)
-    .fetch_all(pool)
-    .await
+    .bind(delivery.delivery_id)
+    .bind(lease_expires_at)
+    .bind(attempt_id)
+    .bind(worker_id)
+    .fetch_one(&mut **tx)
+    .await?;
+
+    Ok(ClaimedDelivery {
+        delivery_id: delivery.delivery_id,
+        event_id: delivery.event_id,
+        endpoint_id: delivery.endpoint_id,
+        merchant_id: delivery.merchant_id,
+        endpoint_url: delivery.endpoint_url,
+        secret_version_id: delivery.secret_version_id,
+        max_attempts: delivery.max_attempts,
+        attempt_id,
+        attempt_count,
+        processing_lease_token: row.get("processing_lease_token"),
+    })
 }
 
 async fn process_delivery(
@@ -1002,12 +1438,13 @@ async fn process_delivery(
     let payload = match build_payload(pool, &delivery).await {
         Ok(payload) => payload,
         Err(sqlx::Error::RowNotFound) => {
-            dead_letter_unrecoverable(
-                pool,
-                &delivery,
-                "referenced event or payment row no longer exists",
-            )
-            .await?;
+            let result = DeliveryResult {
+                outcome: DeliveryOutcome::PermanentFailure,
+                http_status: None,
+                response_body_sample: None,
+                error_message: Some("referenced event or payment row no longer exists".to_string()),
+            };
+            finalize_attempt_and_delivery(pool, &delivery, &result).await?;
             return Ok(());
         }
         Err(error) => return Err(error),
@@ -1023,7 +1460,6 @@ async fn process_delivery(
     )
     .await?;
 
-    let attempt = create_attempt(pool, &delivery).await?;
     append_trace(
         pool,
         delivery.delivery_id,
@@ -1031,29 +1467,12 @@ async fn process_delivery(
         "http_request_started",
         "active",
         "HTTP request started",
-        json!({ "attempt": attempt.attempt_count, "url": delivery.endpoint_url }),
+        json!({ "attempt": delivery.attempt_count, "url": delivery.endpoint_url }),
     )
     .await?;
 
-    let result = send_webhook(pool, client, &delivery, attempt.attempt_count, &payload).await;
-    complete_attempt(pool, attempt.attempt_id, &result).await?;
-
-    append_trace(
-        pool,
-        delivery.delivery_id,
-        delivery.event_id,
-        "attempt_recorded",
-        "succeeded",
-        "Attempt recorded",
-        json!({
-            "attempt": attempt.attempt_count,
-            "outcome": result.outcome.as_db_str(),
-            "http_status": result.http_status
-        }),
-    )
-    .await?;
-
-    transition_delivery(pool, &delivery, attempt.attempt_count, &result).await?;
+    let result = send_webhook(pool, client, &delivery, delivery.attempt_count, &payload).await;
+    finalize_attempt_and_delivery(pool, &delivery, &result).await?;
 
     Ok(())
 }
@@ -1103,45 +1522,6 @@ async fn build_payload(pool: &PgPool, delivery: &ClaimedDelivery) -> Result<Valu
             "updated_at": payment_updated_at
         }
     }))
-}
-
-async fn create_attempt(
-    pool: &PgPool,
-    delivery: &ClaimedDelivery,
-) -> Result<AttemptStart, sqlx::Error> {
-    let row = sqlx::query(
-        "INSERT INTO delivery_attempts (
-            delivery_id,
-            event_id,
-            endpoint_id,
-            attempt_count,
-            outcome,
-            started_at
-         )
-         VALUES (
-            $1,
-            $2,
-            $3,
-            (
-                SELECT COUNT(*) + 1
-                FROM delivery_attempts
-                WHERE delivery_id = $1
-            ),
-            'unknown',
-            NOW()
-         )
-         RETURNING attempt_id, attempt_count",
-    )
-    .bind(delivery.delivery_id)
-    .bind(delivery.event_id)
-    .bind(delivery.endpoint_id)
-    .fetch_one(pool)
-    .await?;
-
-    Ok(AttemptStart {
-        attempt_id: row.get("attempt_id"),
-        attempt_count: row.get("attempt_count"),
-    })
 }
 
 async fn send_webhook(
@@ -1273,11 +1653,38 @@ fn classify_status(status: u16) -> DeliveryOutcome {
     }
 }
 
-async fn complete_attempt(
+async fn finalize_attempt_and_delivery(
     pool: &PgPool,
-    attempt_id: i64,
+    delivery: &ClaimedDelivery,
     result: &DeliveryResult,
 ) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let guard = sqlx::query(
+        "SELECT delivery_id
+         FROM webhook_deliveries
+         WHERE delivery_id = $1
+           AND status = 'processing'
+           AND current_attempt_id = $2
+           AND processing_lease_token = $3::uuid
+         FOR UPDATE",
+    )
+    .bind(delivery.delivery_id)
+    .bind(delivery.attempt_id)
+    .bind(&delivery.processing_lease_token)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    if guard.is_none() {
+        tx.rollback().await?;
+        tracing::warn!(
+            delivery_id = delivery.delivery_id,
+            attempt_id = delivery.attempt_id,
+            attempt = delivery.attempt_count,
+            "stale worker completion ignored because delivery fence no longer matches"
+        );
+        return Ok(());
+    }
+
     sqlx::query(
         "UPDATE delivery_attempts
          SET http_status = $2,
@@ -1285,120 +1692,204 @@ async fn complete_attempt(
              error_message = $4,
              response_body_sample = $5,
              completed_at = NOW()
-         WHERE attempt_id = $1",
+         WHERE attempt_id = $1
+           AND delivery_id = $6",
     )
-    .bind(attempt_id)
+    .bind(delivery.attempt_id)
     .bind(result.http_status.map(|status| status as i16))
     .bind(result.outcome.as_db_str())
     .bind(delivery_error(result))
     .bind(&result.response_body_sample)
-    .execute(pool)
+    .bind(delivery.delivery_id)
+    .execute(&mut *tx)
     .await?;
 
+    match decide_final_delivery_state(
+        result.outcome.as_db_str(),
+        delivery.attempt_count,
+        delivery.max_attempts,
+    ) {
+        FinalDeliveryState::Delivered => {
+            let update = sqlx::query(
+                "UPDATE webhook_deliveries
+                 SET status = 'delivered',
+                     next_attempt_at = NULL,
+                     last_error = NULL,
+                     processing_started_at = NULL,
+                     processing_lease_token = NULL,
+                     processing_lease_expires_at = NULL,
+                     current_attempt_id = NULL,
+                     processing_worker_id = NULL,
+                     queue_token = NULL,
+                     final_state_at = NOW(),
+                     updated_at = NOW()
+                 WHERE delivery_id = $1
+                   AND status = 'processing'
+                   AND current_attempt_id = $2
+                   AND processing_lease_token = $3::uuid",
+            )
+            .bind(delivery.delivery_id)
+            .bind(delivery.attempt_id)
+            .bind(&delivery.processing_lease_token)
+            .execute(&mut *tx)
+            .await?;
+            if update.rows_affected() == 0 {
+                tx.rollback().await?;
+                tracing::warn!(
+                    delivery_id = delivery.delivery_id,
+                    attempt_id = delivery.attempt_id,
+                    "stale worker delivered transition ignored after guarded update matched zero rows"
+                );
+                return Ok(());
+            }
+
+            append_trace_in_tx(
+                &mut tx,
+                delivery.delivery_id,
+                delivery.event_id,
+                "delivered",
+                "succeeded",
+                "Delivery succeeded",
+                json!({ "attempt": delivery.attempt_count }),
+            )
+            .await?;
+        }
+        FinalDeliveryState::Retrying => {
+            let next_attempt_at = Utc::now() + retry_delay(delivery.attempt_count);
+            let update = sqlx::query(
+                "UPDATE webhook_deliveries
+                 SET status = 'retrying',
+                     next_attempt_at = $4,
+                     last_error = $5,
+                     processing_started_at = NULL,
+                     processing_lease_token = NULL,
+                     processing_lease_expires_at = NULL,
+                     current_attempt_id = NULL,
+                     processing_worker_id = NULL,
+                     queued_at = NULL,
+                     queue_token = NULL,
+                     published_at = NULL,
+                     redis_message_id = NULL,
+                     updated_at = NOW()
+                 WHERE delivery_id = $1
+                   AND status = 'processing'
+                   AND current_attempt_id = $2
+                   AND processing_lease_token = $3::uuid",
+            )
+            .bind(delivery.delivery_id)
+            .bind(delivery.attempt_id)
+            .bind(&delivery.processing_lease_token)
+            .bind(next_attempt_at)
+            .bind(delivery_error(result))
+            .execute(&mut *tx)
+            .await?;
+            if update.rows_affected() == 0 {
+                tx.rollback().await?;
+                tracing::warn!(
+                    delivery_id = delivery.delivery_id,
+                    attempt_id = delivery.attempt_id,
+                    "stale worker retry transition ignored after guarded update matched zero rows"
+                );
+                return Ok(());
+            }
+
+            append_trace_in_tx(
+                &mut tx,
+                delivery.delivery_id,
+                delivery.event_id,
+                "retry_scheduled",
+                "retrying",
+                "Retry scheduled",
+                json!({ "attempt": delivery.attempt_count, "next_attempt_at": next_attempt_at }),
+            )
+            .await?;
+        }
+        FinalDeliveryState::DeadLettered => {
+            let update = sqlx::query(
+                "UPDATE webhook_deliveries
+                 SET status = 'dead_lettered',
+                     next_attempt_at = NULL,
+                     last_error = $4,
+                     processing_started_at = NULL,
+                     processing_lease_token = NULL,
+                     processing_lease_expires_at = NULL,
+                     current_attempt_id = NULL,
+                     processing_worker_id = NULL,
+                     queue_token = NULL,
+                     final_state_at = NOW(),
+                     updated_at = NOW()
+                 WHERE delivery_id = $1
+                   AND status = 'processing'
+                   AND current_attempt_id = $2
+                   AND processing_lease_token = $3::uuid",
+            )
+            .bind(delivery.delivery_id)
+            .bind(delivery.attempt_id)
+            .bind(&delivery.processing_lease_token)
+            .bind(delivery_error(result))
+            .execute(&mut *tx)
+            .await?;
+            if update.rows_affected() == 0 {
+                tx.rollback().await?;
+                tracing::warn!(
+                    delivery_id = delivery.delivery_id,
+                    attempt_id = delivery.attempt_id,
+                    "stale worker dead-letter transition ignored after guarded update matched zero rows"
+                );
+                return Ok(());
+            }
+
+            append_trace_in_tx(
+                &mut tx,
+                delivery.delivery_id,
+                delivery.event_id,
+                "dead_lettered",
+                "dead_lettered",
+                "Delivery dead-lettered",
+                json!({ "attempt": delivery.attempt_count, "outcome": result.outcome.as_db_str() }),
+            )
+            .await?;
+        }
+    }
+
+    tx.commit().await?;
     Ok(())
 }
 
-async fn transition_delivery(
-    pool: &PgPool,
-    delivery: &ClaimedDelivery,
+fn decide_final_delivery_state(
+    outcome: &str,
     attempt_count: i64,
-    result: &DeliveryResult,
-) -> Result<(), sqlx::Error> {
-    if matches!(result.outcome, DeliveryOutcome::Success) {
-        sqlx::query(
-            "UPDATE webhook_deliveries
-             SET status = 'delivered',
-                 next_attempt_at = NULL,
-                 last_error = NULL,
-                 processing_started_at = NULL,
-                 final_state_at = NOW(),
-                 updated_at = NOW()
-             WHERE delivery_id = $1",
-        )
-        .bind(delivery.delivery_id)
-        .execute(pool)
-        .await?;
-
-        append_trace(
-            pool,
-            delivery.delivery_id,
-            delivery.event_id,
-            "delivered",
-            "succeeded",
-            "Delivery succeeded",
-            json!({ "attempt": attempt_count }),
-        )
-        .await?;
-
-        return Ok(());
+    max_attempts: i64,
+) -> FinalDeliveryState {
+    if outcome == "success" {
+        return FinalDeliveryState::Delivered;
     }
 
-    if result.outcome.is_retryable() && attempt_count < delivery.max_attempts {
-        let next_attempt_at = Utc::now() + retry_delay(attempt_count);
-        sqlx::query(
-            "UPDATE webhook_deliveries
-             SET status = 'retrying',
-                 next_attempt_at = $2,
-                 last_error = $3,
-                 processing_started_at = NULL,
-                 queued_at = NULL,
-                 published_at = NULL,
-                 redis_message_id = NULL,
-                 updated_at = NOW()
-             WHERE delivery_id = $1",
-        )
-        .bind(delivery.delivery_id)
-        .bind(next_attempt_at)
-        .bind(delivery_error(result))
-        .execute(pool)
-        .await?;
-
-        append_trace(
-            pool,
-            delivery.delivery_id,
-            delivery.event_id,
-            "retry_scheduled",
-            "retrying",
-            "Retry scheduled",
-            json!({ "attempt": attempt_count, "next_attempt_at": next_attempt_at }),
-        )
-        .await?;
-
-        return Ok(());
+    if is_retryable_outcome(outcome) && attempt_count < max_attempts {
+        return FinalDeliveryState::Retrying;
     }
 
-    sqlx::query(
-        "UPDATE webhook_deliveries
-         SET status = 'dead_lettered',
-             next_attempt_at = NULL,
-             last_error = $2,
-             processing_started_at = NULL,
-             final_state_at = NOW(),
-             updated_at = NOW()
-         WHERE delivery_id = $1",
-    )
-    .bind(delivery.delivery_id)
-    .bind(delivery_error(result))
-    .execute(pool)
-    .await?;
+    FinalDeliveryState::DeadLettered
+}
 
-    append_trace(
-        pool,
-        delivery.delivery_id,
-        delivery.event_id,
-        "dead_lettered",
-        "dead_lettered",
-        "Delivery dead-lettered",
-        json!({ "attempt": attempt_count, "outcome": result.outcome.as_db_str() }),
+fn is_retryable_outcome(outcome: &str) -> bool {
+    matches!(
+        outcome,
+        "temporary_failure" | "timeout" | "abandoned" | "unknown"
     )
-    .await?;
-
-    Ok(())
 }
 
 fn retry_delay(attempt_count: i64) -> chrono::Duration {
     let exponent = (attempt_count - 1).clamp(0, 6) as u32;
     let seconds = 5_i64.saturating_mul(2_i64.saturating_pow(exponent));
+    chrono::Duration::seconds(seconds)
+}
+
+fn queue_publish_backoff(queue_attempt_count: i64) -> chrono::Duration {
+    let exponent = (queue_attempt_count - 1).clamp(0, 6) as u32;
+    let seconds = 5_i64
+        .saturating_mul(2_i64.saturating_pow(exponent))
+        .min(300);
     chrono::Duration::seconds(seconds)
 }
 
@@ -1411,35 +1902,34 @@ fn delivery_error(result: &DeliveryResult) -> String {
     })
 }
 
-async fn dead_letter_unrecoverable(
-    pool: &PgPool,
-    delivery: &ClaimedDelivery,
-    reason: &str,
+async fn append_trace_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    delivery_id: i64,
+    event_id: i64,
+    step: &str,
+    status: &str,
+    title: &str,
+    metadata: Value,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "UPDATE webhook_deliveries
-         SET status = 'dead_lettered',
-             next_attempt_at = NULL,
-             last_error = $2,
-             processing_started_at = NULL,
-             final_state_at = NOW(),
-             updated_at = NOW()
-         WHERE delivery_id = $1",
+        "INSERT INTO delivery_trace_events (
+            delivery_id,
+            event_id,
+            step,
+            status,
+            title,
+            metadata_json,
+            occurred_at
+         )
+         VALUES ($1, $2, $3, $4, $5, $6, NOW())",
     )
-    .bind(delivery.delivery_id)
-    .bind(reason)
-    .execute(pool)
-    .await?;
-
-    append_trace(
-        pool,
-        delivery.delivery_id,
-        delivery.event_id,
-        "dead_lettered",
-        "dead_lettered",
-        "Delivery dead-lettered",
-        json!({ "reason": reason }),
-    )
+    .bind(delivery_id)
+    .bind(event_id)
+    .bind(step)
+    .bind(status)
+    .bind(title)
+    .bind(metadata)
+    .execute(&mut **tx)
     .await?;
 
     Ok(())
@@ -1478,30 +1968,81 @@ async fn append_trace(
     Ok(())
 }
 
-async fn append_delivery_trace_by_id(
-    pool: &PgPool,
-    delivery_id: i64,
-    step: &str,
-    status: &str,
-    title: &str,
-    metadata: Value,
-) -> Result<(), sqlx::Error> {
-    let Some(row) = sqlx::query("SELECT event_id FROM webhook_deliveries WHERE delivery_id = $1")
-        .bind(delivery_id)
-        .fetch_optional(pool)
-        .await?
-    else {
-        return Ok(());
-    };
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    append_trace(
-        pool,
-        delivery_id,
-        row.get("event_id"),
-        step,
-        status,
-        title,
-        metadata,
-    )
-    .await
+    #[test]
+    fn success_attempt_terminalizes_as_delivered() {
+        assert_eq!(
+            decide_final_delivery_state("success", 1, 5),
+            FinalDeliveryState::Delivered
+        );
+    }
+
+    #[test]
+    fn retryable_attempt_with_remaining_budget_schedules_retry() {
+        assert_eq!(
+            decide_final_delivery_state("temporary_failure", 1, 5),
+            FinalDeliveryState::Retrying
+        );
+    }
+
+    #[test]
+    fn max_attempts_one_abandoned_attempt_terminalizes() {
+        assert_eq!(
+            decide_final_delivery_state("abandoned", 1, 1),
+            FinalDeliveryState::DeadLettered
+        );
+    }
+
+    #[test]
+    fn unknown_exhausted_attempt_terminalizes() {
+        assert_eq!(
+            decide_final_delivery_state("unknown", 3, 3),
+            FinalDeliveryState::DeadLettered
+        );
+    }
+
+    #[test]
+    fn permanent_failure_terminalizes_even_with_remaining_budget() {
+        assert_eq!(
+            decide_final_delivery_state("permanent_failure", 1, 5),
+            FinalDeliveryState::DeadLettered
+        );
+    }
+
+    #[test]
+    fn processing_lease_duration_exceeds_request_timeout() {
+        let timeout = Duration::from_millis(3_000);
+        assert!(processing_lease_duration(timeout) > chrono::Duration::from_std(timeout).unwrap());
+    }
+
+    #[test]
+    fn redis_queue_token_parser_accepts_uuid_text() {
+        let token = "A0EebC99-9C0B-4EF8-BB6D-6BB9BD380A11";
+        let value = redis::Value::BulkString(token.as_bytes().to_vec());
+
+        assert_eq!(
+            redis_value_to_uuid_text(&value).as_deref(),
+            Some("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11")
+        );
+    }
+
+    #[test]
+    fn redis_queue_token_parser_rejects_missing_or_invalid_token() {
+        assert!(redis_value_to_uuid_text(&redis::Value::Nil).is_none());
+        assert!(
+            redis_value_to_uuid_text(&redis::Value::BulkString(b"not-a-uuid".to_vec())).is_none()
+        );
+        assert!(redis_value_to_uuid_text(&redis::Value::Int(42)).is_none());
+    }
+
+    #[test]
+    fn queue_publish_backoff_moves_retry_into_future_and_caps() {
+        assert_eq!(queue_publish_backoff(1), chrono::Duration::seconds(5));
+        assert_eq!(queue_publish_backoff(2), chrono::Duration::seconds(10));
+        assert_eq!(queue_publish_backoff(3), chrono::Duration::seconds(20));
+        assert_eq!(queue_publish_backoff(100), chrono::Duration::seconds(300));
+    }
 }
