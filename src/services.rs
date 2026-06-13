@@ -17,9 +17,9 @@ use crate::{
         CreateEndpointResponse, CreatePaymentRequest, CreatePaymentResponse, DashboardSummary,
         DeliveryAttemptItem, DeliveryDetailResponse, DeliveryListItem, DeliveryListQuery,
         DeliveryRetryLineage, DeliveryTraceItem, EndpointListItem, EndpointStatsItem,
-        EventFanoutResponse, EventListItem, PaginatedDeliveriesResponse, RetryBacklogSummary,
-        RetryDeliveryRequest, RetryDeliveryResponse, TraceGraphEdge, TraceGraphNode,
-        TraceGraphResponse, UpdateEndpointRequest,
+        EventFanoutDeliveryItem, EventFanoutResponse, EventListItem, PaginatedDeliveriesResponse,
+        RetryBacklogSummary, RetryDeliveryRequest, RetryDeliveryResponse, TraceGraphEdge,
+        TraceGraphNode, TraceGraphResponse, UpdateEndpointRequest,
     },
 };
 
@@ -1086,7 +1086,10 @@ pub async fn list_dashboard_deliveries(
             latest.http_status AS last_http_status,
             latest.outcome AS last_outcome,
             latest.duration_ms,
-            COALESCE(d.last_error, latest.error_message) AS last_error,
+            CASE
+                WHEN latest.outcome = 'success' THEN NULL
+                ELSE COALESCE(d.last_error, latest.error_message)
+            END AS last_error,
             d.next_attempt_at,
             d.created_at,
             d.updated_at
@@ -1184,8 +1187,8 @@ pub async fn list_dashboard_deliveries(
 pub async fn list_deliveries_for_event(
     pool: &PgPool,
     event_id: i64,
-) -> AppResult<Vec<DeliveryListItem>> {
-    let rows = sqlx::query_as::<_, DeliveryListItem>(
+) -> AppResult<Vec<EventFanoutDeliveryItem>> {
+    let rows = sqlx::query_as::<_, EventFanoutDeliveryItem>(
         "SELECT
             d.delivery_id,
             d.event_id,
@@ -1199,13 +1202,21 @@ pub async fn list_deliveries_for_event(
             latest.http_status AS last_http_status,
             latest.outcome AS last_outcome,
             latest.duration_ms,
-            COALESCE(d.last_error, latest.error_message) AS last_error,
+            CASE
+                WHEN latest.outcome = 'success' THEN NULL
+                ELSE COALESCE(d.last_error, latest.error_message)
+            END AS last_error,
             d.next_attempt_at,
             d.created_at,
-            d.updated_at
+            d.updated_at,
+            endpoint.description AS endpoint_description,
+            endpoint.enabled AS endpoint_enabled,
+            COALESCE(subscriptions.subscribed_events, ARRAY[]::TEXT[]) AS endpoint_subscribed_events
          FROM webhook_deliveries d
          INNER JOIN domain_events e
             ON e.event_id = d.event_id
+         INNER JOIN webhook_endpoints endpoint
+            ON endpoint.endpoint_id = d.endpoint_id
          LEFT JOIN delivery_attempts a
             ON a.delivery_id = d.delivery_id
          LEFT JOIN LATERAL (
@@ -1220,8 +1231,22 @@ pub async fn list_deliveries_for_event(
             ORDER BY attempt_count DESC, attempt_id DESC
             LIMIT 1
          ) latest ON TRUE
+         LEFT JOIN LATERAL (
+            SELECT array_agg(s.event_type ORDER BY s.event_type) AS subscribed_events
+            FROM webhook_endpoint_subscriptions s
+            WHERE s.endpoint_id = d.endpoint_id
+         ) subscriptions ON TRUE
          WHERE d.event_id = $1
-         GROUP BY d.delivery_id, e.event_type, latest.http_status, latest.outcome, latest.error_message, latest.duration_ms
+         GROUP BY
+            d.delivery_id,
+            e.event_type,
+            endpoint.description,
+            endpoint.enabled,
+            subscriptions.subscribed_events,
+            latest.http_status,
+            latest.outcome,
+            latest.error_message,
+            latest.duration_ms
          ORDER BY d.created_at ASC",
     )
     .bind(event_id)
@@ -1246,7 +1271,10 @@ pub async fn get_delivery(pool: &PgPool, delivery_id: i64) -> AppResult<Delivery
             latest.http_status AS last_http_status,
             latest.outcome AS last_outcome,
             latest.duration_ms,
-            COALESCE(d.last_error, latest.error_message) AS last_error,
+            CASE
+                WHEN latest.outcome = 'success' THEN NULL
+                ELSE COALESCE(d.last_error, latest.error_message)
+            END AS last_error,
             d.next_attempt_at,
             d.created_at,
             d.updated_at

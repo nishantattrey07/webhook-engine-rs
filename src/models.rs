@@ -165,7 +165,30 @@ pub struct DeliveryTraceItem {
 #[derive(Debug, Clone, Serialize)]
 pub struct EventFanoutResponse {
     pub event: EventListItem,
-    pub deliveries: Vec<DeliveryListItem>,
+    pub deliveries: Vec<EventFanoutDeliveryItem>,
+}
+
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct EventFanoutDeliveryItem {
+    pub delivery_id: i64,
+    pub event_id: i64,
+    pub event_type: String,
+    pub merchant_id: i64,
+    pub endpoint_id: i64,
+    pub endpoint_url: String,
+    pub status: String,
+    pub attempt_count: i64,
+    pub max_attempts: i64,
+    pub last_http_status: Option<i16>,
+    pub last_outcome: Option<String>,
+    pub duration_ms: Option<i64>,
+    pub last_error: Option<String>,
+    pub next_attempt_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub endpoint_description: Option<String>,
+    pub endpoint_enabled: bool,
+    pub endpoint_subscribed_events: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

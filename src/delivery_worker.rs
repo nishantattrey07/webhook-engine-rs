@@ -1941,13 +1941,15 @@ fn queue_publish_backoff(queue_attempt_count: i64) -> chrono::Duration {
     chrono::Duration::seconds(seconds)
 }
 
-fn delivery_error(result: &DeliveryResult) -> String {
-    result.error_message.clone().unwrap_or_else(|| {
-        result
-            .outcome
-            .error_message()
-            .unwrap_or_else(|| result.outcome.as_db_str().to_string())
-    })
+fn delivery_error(result: &DeliveryResult) -> Option<String> {
+    result
+        .error_message
+        .clone()
+        .or_else(|| result.outcome.error_message())
+        .or_else(|| match result.outcome {
+            DeliveryOutcome::Success => None,
+            _ => Some(result.outcome.as_db_str().to_string()),
+        })
 }
 
 async fn append_trace_in_tx(
@@ -2079,6 +2081,18 @@ mod tests {
             sha256_hex(body),
             "c97e4f7c261e1fb5e7a8c0db118ebd23d822fd09a288a17733f4c4c16e4c8d50"
         );
+    }
+
+    #[test]
+    fn successful_delivery_has_no_error_message() {
+        let result = DeliveryResult {
+            outcome: DeliveryOutcome::Success,
+            http_status: Some(200),
+            response_body_sample: None,
+            error_message: None,
+        };
+
+        assert_eq!(delivery_error(&result), None);
     }
 
     #[test]
