@@ -17,9 +17,10 @@ use crate::{
         CreateEndpointResponse, CreatePaymentRequest, CreatePaymentResponse, DashboardSummary,
         DeliveryAttemptItem, DeliveryDetailResponse, DeliveryListItem, DeliveryListQuery,
         DeliveryRetryLineage, DeliveryTraceItem, EndpointListItem, EndpointStatsItem,
-        EventFanoutDeliveryItem, EventFanoutResponse, EventListItem, PaginatedDeliveriesResponse,
-        RetryBacklogSummary, RetryDeliveryRequest, RetryDeliveryResponse, TraceGraphEdge,
-        TraceGraphNode, TraceGraphResponse, UpdateEndpointRequest,
+        EventFanoutDeliveryItem, EventFanoutResponse, EventListItem, EventListQuery,
+        PaginatedDeliveriesResponse, PaginatedEventsResponse, RetryBacklogSummary,
+        RetryDeliveryRequest, RetryDeliveryResponse, TraceGraphEdge, TraceGraphNode,
+        TraceGraphResponse, UpdateEndpointRequest,
     },
 };
 
@@ -58,6 +59,15 @@ struct DeliverySearch {
     status: Option<String>,
     outcome: Option<String>,
     endpoint_pattern: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct EventSearch {
+    event_id: Option<i64>,
+    merchant_id: Option<i64>,
+    object_id: Option<i64>,
+    event_type: Option<String>,
+    object_type: Option<String>,
 }
 
 fn normalize_search(value: Option<&str>) -> Option<String> {
@@ -159,6 +169,58 @@ fn delivery_search(value: Option<&str>) -> DeliverySearch {
     }
 
     search.endpoint_pattern = normalize_search(Some(raw));
+    search
+}
+
+fn event_search(value: Option<&str>) -> EventSearch {
+    let Some(raw_value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return EventSearch {
+            event_id: None,
+            merchant_id: None,
+            object_id: None,
+            event_type: None,
+            object_type: None,
+        };
+    };
+
+    let normalized = raw_value.to_ascii_lowercase();
+    let number = extract_search_number(Some(raw_value));
+    let mut search = EventSearch {
+        event_id: None,
+        merchant_id: None,
+        object_id: None,
+        event_type: None,
+        object_type: None,
+    };
+
+    if normalized.starts_with("evt_") || normalized.starts_with("event ") {
+        search.event_id = number;
+        return search;
+    }
+
+    if normalized.starts_with("merchant ") {
+        search.merchant_id = number;
+        return search;
+    }
+
+    if normalized.starts_with("object ") || normalized.starts_with("payment ") {
+        search.object_id = number;
+        return search;
+    }
+
+    if let Some(number) = number {
+        search.event_id = Some(number);
+        search.merchant_id = Some(number);
+        search.object_id = Some(number);
+        return search;
+    }
+
+    if ALLOWED_EVENT_TYPES.contains(&normalized.as_str()) {
+        search.event_type = Some(normalized);
+    } else if normalized == "payment" {
+        search.object_type = Some(normalized);
+    }
+
     search
 }
 
@@ -503,31 +565,20 @@ async fn create_payment_in_tx(
     .await?
     .get(0);
 
-    let snapshot = json!({
-        "payment_id": payment_id,
-        "merchant_id": request.merchant_id,
-        "order_id": request.order_id,
-        "amount": request.amount,
-        "status": status,
-        "mode_of_payment": request.mode_of_payment,
-    });
-
     let event_id: i64 = sqlx::query(
         "INSERT INTO domain_events (
             merchant_id,
             object_type,
             object_id,
             event_type,
-            event_snapshot_json,
             created_at
          )
-         VALUES ($1, 'payment', $2, $3, $4, NOW())
+         VALUES ($1, 'payment', $2, $3, NOW())
          RETURNING event_id",
     )
     .bind(request.merchant_id)
     .bind(payment_id)
     .bind(event_type)
-    .bind(&snapshot)
     .fetch_one(&mut **tx)
     .await?
     .get(0);
@@ -791,7 +842,15 @@ async fn append_event_level_trace(
     Ok(())
 }
 
-pub async fn list_events(pool: &PgPool) -> AppResult<Vec<EventListItem>> {
+pub async fn list_events(
+    pool: &PgPool,
+    query: EventListQuery,
+) -> AppResult<PaginatedEventsResponse> {
+    let limit = query.limit.unwrap_or(50).clamp(1, 100);
+    let fetch_limit = limit + 1;
+    let event_type = normalize_exact_filter(query.event_type);
+    let search = event_search(query.search.as_deref());
+
     let rows = sqlx::query_as::<_, EventListItem>(
         "SELECT
             event_id,
@@ -799,16 +858,52 @@ pub async fn list_events(pool: &PgPool) -> AppResult<Vec<EventListItem>> {
             object_type,
             object_id,
             event_type,
-            event_snapshot_json,
             created_at
          FROM domain_events
-         ORDER BY created_at DESC
-         LIMIT 100",
+         WHERE ($1::BIGINT IS NULL OR merchant_id = $1)
+           AND ($2::TEXT IS NULL OR event_type = $2)
+           AND (
+                (
+                    $3::BIGINT IS NULL
+                    AND $4::BIGINT IS NULL
+                    AND $5::BIGINT IS NULL
+                    AND $6::TEXT IS NULL
+                    AND $7::TEXT IS NULL
+                )
+                OR event_id = $3
+                OR merchant_id = $4
+                OR object_id = $5
+                OR event_type = $6
+                OR object_type = $7
+           )
+           AND ($8::BIGINT IS NULL OR event_id < $8)
+         ORDER BY event_id DESC
+         LIMIT $9",
     )
+    .bind(query.merchant_id)
+    .bind(event_type)
+    .bind(search.event_id)
+    .bind(search.merchant_id)
+    .bind(search.object_id)
+    .bind(search.event_type)
+    .bind(search.object_type)
+    .bind(query.cursor)
+    .bind(fetch_limit)
     .fetch_all(pool)
     .await?;
 
-    Ok(rows)
+    let mut items = rows;
+    let next_cursor = if items.len() > limit as usize {
+        items.pop().map(|item| item.event_id)
+    } else {
+        None
+    };
+
+    Ok(PaginatedEventsResponse {
+        items,
+        next_cursor,
+        limit,
+    })
 }
 
 pub async fn get_event(pool: &PgPool, event_id: i64) -> AppResult<EventListItem> {
@@ -819,7 +914,6 @@ pub async fn get_event(pool: &PgPool, event_id: i64) -> AppResult<EventListItem>
             object_type,
             object_id,
             event_type,
-            event_snapshot_json,
             created_at
          FROM domain_events
          WHERE event_id = $1",
@@ -1053,14 +1147,6 @@ fn active_deliveries(queued: i64, processing: i64, retrying: i64) -> i64 {
 }
 
 pub async fn list_deliveries(
-    pool: &PgPool,
-    query: DeliveryListQuery,
-) -> AppResult<Vec<DeliveryListItem>> {
-    let mut response = list_dashboard_deliveries(pool, query).await?;
-    Ok(std::mem::take(&mut response.items))
-}
-
-pub async fn list_dashboard_deliveries(
     pool: &PgPool,
     query: DeliveryListQuery,
 ) -> AppResult<PaginatedDeliveriesResponse> {
@@ -1758,6 +1844,30 @@ mod tests {
     }
 
     #[test]
+    fn event_search_routes_prefixed_event_id() {
+        let search = event_search(Some("evt_000137"));
+
+        assert_eq!(search.event_id, Some(137));
+        assert_eq!(search.merchant_id, None);
+    }
+
+    #[test]
+    fn event_search_routes_numeric_to_indexed_ids() {
+        let search = event_search(Some("334"));
+
+        assert_eq!(search.event_id, Some(334));
+        assert_eq!(search.merchant_id, Some(334));
+        assert_eq!(search.object_id, Some(334));
+    }
+
+    #[test]
+    fn event_search_routes_event_type() {
+        let search = event_search(Some("payment_succeeded"));
+
+        assert_eq!(search.event_type.as_deref(), Some("payment_succeeded"));
+    }
+
+    #[test]
     fn endpoint_url_rejects_local_targets_without_demo_allowance() {
         for url in [
             "http://localhost:3000/webhook",
@@ -1832,10 +1942,9 @@ mod tests {
                 merchant_id,
                 object_type,
                 object_id,
-                event_type,
-                event_snapshot_json
+                event_type
              )
-             VALUES ($1, 'payment', $2, 'payment_succeeded', '{}'::jsonb)
+             VALUES ($1, 'payment', $2, 'payment_succeeded')
              RETURNING event_id",
         )
         .bind(merchant_id)

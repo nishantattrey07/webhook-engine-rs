@@ -108,8 +108,23 @@ pub struct EventListItem {
     pub object_type: String,
     pub object_id: i64,
     pub event_type: String,
-    pub event_snapshot_json: Value,
     pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct EventListQuery {
+    pub merchant_id: Option<i64>,
+    pub event_type: Option<String>,
+    pub search: Option<String>,
+    pub cursor: Option<i64>,
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PaginatedEventsResponse {
+    pub items: Vec<EventListItem>,
+    pub next_cursor: Option<i64>,
+    pub limit: i64,
 }
 
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]

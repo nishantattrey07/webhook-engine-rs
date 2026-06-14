@@ -26,7 +26,6 @@ pub fn router(state: AppState) -> Router {
         .route("/api/payments", post(create_payment))
         .route("/api/payments/bulk", post(create_bulk_payments))
         .route("/api/dashboard/summary", get(get_dashboard_summary))
-        .route("/api/dashboard/deliveries", get(list_dashboard_deliveries))
         .route("/api/endpoints/stats", get(list_endpoint_stats))
         .route("/api/events", get(list_events))
         .route("/api/events/:event_id", get(get_event))
@@ -114,18 +113,11 @@ async fn get_dashboard_summary(
     Ok(Json(summary))
 }
 
-async fn list_dashboard_deliveries(
-    State(state): State<AppState>,
-    Query(query): Query<crate::models::DeliveryListQuery>,
-) -> AppResult<Json<crate::models::PaginatedDeliveriesResponse>> {
-    let deliveries = services::list_dashboard_deliveries(&state.pool, query).await?;
-    Ok(Json(deliveries))
-}
-
 async fn list_events(
     State(state): State<AppState>,
-) -> AppResult<Json<Vec<crate::models::EventListItem>>> {
-    let events = services::list_events(&state.pool).await?;
+    Query(query): Query<crate::models::EventListQuery>,
+) -> AppResult<Json<crate::models::PaginatedEventsResponse>> {
+    let events = services::list_events(&state.pool, query).await?;
     Ok(Json(events))
 }
 
@@ -148,7 +140,7 @@ async fn get_event_fanout(
 async fn list_deliveries(
     State(state): State<AppState>,
     Query(query): Query<crate::models::DeliveryListQuery>,
-) -> AppResult<Json<Vec<crate::models::DeliveryListItem>>> {
+) -> AppResult<Json<crate::models::PaginatedDeliveriesResponse>> {
     let deliveries = services::list_deliveries(&state.pool, query).await?;
     Ok(Json(deliveries))
 }

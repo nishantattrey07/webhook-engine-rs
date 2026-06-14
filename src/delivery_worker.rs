@@ -1484,7 +1484,6 @@ async fn build_payload(pool: &PgPool, delivery: &ClaimedDelivery) -> Result<Valu
     let row = sqlx::query(
         "SELECT
             e.event_type,
-            e.event_snapshot_json,
             p.payment_id,
             p.merchant_id,
             p.order_id,
@@ -1503,7 +1502,6 @@ async fn build_payload(pool: &PgPool, delivery: &ClaimedDelivery) -> Result<Valu
     .await?;
 
     let event_type: String = row.get("event_type");
-    let event_snapshot: Value = row.get("event_snapshot_json");
     let payment_created_at: DateTime<Utc> = row.get("created_at");
     let payment_updated_at: DateTime<Utc> = row.get("updated_at");
 
@@ -1513,8 +1511,7 @@ async fn build_payload(pool: &PgPool, delivery: &ClaimedDelivery) -> Result<Valu
         "event_type": event_type,
         "merchant_id": delivery.merchant_id,
         "endpoint_id": delivery.endpoint_id,
-        "event_snapshot": event_snapshot,
-        "current_object": {
+        "data": {
             "payment_id": row.get::<i64, _>("payment_id"),
             "merchant_id": row.get::<i64, _>("merchant_id"),
             "order_id": row.get::<i64, _>("order_id"),
