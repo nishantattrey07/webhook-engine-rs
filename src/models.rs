@@ -109,6 +109,13 @@ pub struct EventListItem {
     pub object_id: i64,
     pub event_type: String,
     pub created_at: DateTime<Utc>,
+    pub delivery_count: i64,
+    pub pending_count: i64,
+    pub queued_count: i64,
+    pub processing_count: i64,
+    pub retrying_count: i64,
+    pub delivered_count: i64,
+    pub dead_lettered_count: i64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -143,6 +150,9 @@ pub struct DeliveryListItem {
     pub duration_ms: Option<i64>,
     pub last_error: Option<String>,
     pub next_attempt_at: Option<DateTime<Utc>>,
+    pub operator_resolved_at: Option<DateTime<Utc>>,
+    pub operator_resolved_by: Option<String>,
+    pub operator_resolution_note: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -158,6 +168,7 @@ pub struct DeliveryAttemptItem {
     pub outcome: String,
     pub error_message: Option<String>,
     pub response_body_sample: Option<String>,
+    pub request_body_hash: Option<String>,
     pub started_at: DateTime<Utc>,
     pub completed_at: Option<DateTime<Utc>>,
     pub duration_ms: Option<i64>,
@@ -199,6 +210,9 @@ pub struct EventFanoutDeliveryItem {
     pub duration_ms: Option<i64>,
     pub last_error: Option<String>,
     pub next_attempt_at: Option<DateTime<Utc>>,
+    pub operator_resolved_at: Option<DateTime<Utc>>,
+    pub operator_resolved_by: Option<String>,
+    pub operator_resolution_note: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub endpoint_description: Option<String>,
@@ -252,6 +266,30 @@ pub struct BulkRetrySkip {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct ResolveDeliveryRequest {
+    pub resolved_by: Option<String>,
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ResolveDeliveryResponse {
+    pub success: bool,
+    pub delivery_id: i64,
+    pub operator_resolved_at: DateTime<Utc>,
+    pub operator_resolved_by: Option<String>,
+    pub operator_resolution_note: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct UnresolveDeliveryResponse {
+    pub success: bool,
+    pub delivery_id: i64,
+    pub operator_resolved_at: Option<DateTime<Utc>>,
+    pub operator_resolved_by: Option<String>,
+    pub operator_resolution_note: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct DeliveryListQuery {
     pub merchant_id: Option<i64>,
     pub endpoint_id: Option<i64>,
@@ -259,6 +297,7 @@ pub struct DeliveryListQuery {
     pub event_type: Option<String>,
     pub endpoint: Option<String>,
     pub status: Option<String>,
+    pub resolution: Option<String>,
     pub search: Option<String>,
     pub time_range: Option<String>,
     pub cursor: Option<i64>,

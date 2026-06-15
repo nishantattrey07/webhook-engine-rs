@@ -1807,12 +1807,19 @@ async fn finalize_attempt_and_delivery(
                 "delivered",
                 "succeeded",
                 "Delivery succeeded",
-                json!({ "attempt": delivery.attempt_count }),
+                json!({
+                    "attempt": delivery.attempt_count,
+                    "max_attempts": delivery.max_attempts,
+                    "outcome": result.outcome.as_db_str(),
+                    "http_status": result.http_status
+                }),
             )
             .await?;
         }
         FinalDeliveryState::Retrying => {
-            let next_attempt_at = Utc::now() + retry_delay(delivery.attempt_count);
+            let retry_backoff = retry_delay(delivery.attempt_count);
+            let next_attempt_at = Utc::now() + retry_backoff;
+            let error_message = delivery_error(result);
             let update = sqlx::query(
                 "UPDATE webhook_deliveries
                  SET status = 'retrying',
@@ -1837,7 +1844,7 @@ async fn finalize_attempt_and_delivery(
             .bind(delivery.attempt_id)
             .bind(&delivery.processing_lease_token)
             .bind(next_attempt_at)
-            .bind(delivery_error(result))
+            .bind(&error_message)
             .execute(&mut *tx)
             .await?;
             if update.rows_affected() == 0 {
@@ -1857,11 +1864,28 @@ async fn finalize_attempt_and_delivery(
                 "retry_scheduled",
                 "retrying",
                 "Retry scheduled",
-                json!({ "attempt": delivery.attempt_count, "next_attempt_at": next_attempt_at }),
+                json!({
+                    "attempt": delivery.attempt_count,
+                    "max_attempts": delivery.max_attempts,
+                    "attempts_remaining": delivery.max_attempts.saturating_sub(delivery.attempt_count),
+                    "outcome": result.outcome.as_db_str(),
+                    "http_status": result.http_status,
+                    "error": error_message,
+                    "next_attempt_at": next_attempt_at,
+                    "retry_delay_ms": retry_backoff.num_milliseconds()
+                }),
             )
             .await?;
         }
         FinalDeliveryState::DeadLettered => {
+            let error_message = delivery_error(result);
+            let terminal_reason = if is_retryable_outcome(result.outcome.as_db_str())
+                && delivery.attempt_count >= delivery.max_attempts
+            {
+                "attempts_exhausted"
+            } else {
+                "permanent_failure"
+            };
             let update = sqlx::query(
                 "UPDATE webhook_deliveries
                  SET status = 'dead_lettered',
@@ -1883,7 +1907,7 @@ async fn finalize_attempt_and_delivery(
             .bind(delivery.delivery_id)
             .bind(delivery.attempt_id)
             .bind(&delivery.processing_lease_token)
-            .bind(delivery_error(result))
+            .bind(&error_message)
             .execute(&mut *tx)
             .await?;
             if update.rows_affected() == 0 {
@@ -1903,7 +1927,14 @@ async fn finalize_attempt_and_delivery(
                 "dead_lettered",
                 "dead_lettered",
                 "Delivery dead-lettered",
-                json!({ "attempt": delivery.attempt_count, "outcome": result.outcome.as_db_str() }),
+                json!({
+                    "attempt": delivery.attempt_count,
+                    "max_attempts": delivery.max_attempts,
+                    "outcome": result.outcome.as_db_str(),
+                    "http_status": result.http_status,
+                    "error": error_message,
+                    "terminal_reason": terminal_reason
+                }),
             )
             .await?;
         }

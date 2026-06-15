@@ -39,6 +39,14 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/deliveries/:delivery_id/retry", post(retry_delivery))
         .route(
+            "/api/deliveries/:delivery_id/resolve",
+            post(resolve_delivery),
+        )
+        .route(
+            "/api/deliveries/:delivery_id/unresolve",
+            post(unresolve_delivery),
+        )
+        .route(
             "/api/deliveries/:delivery_id/attempts",
             get(list_delivery_attempts),
         )
@@ -175,6 +183,23 @@ async fn bulk_retry_deliveries(
     Json(request): Json<crate::models::BulkRetryDeliveriesRequest>,
 ) -> AppResult<Json<crate::models::BulkRetryDeliveriesResponse>> {
     let response = services::bulk_retry_deliveries(&state.pool, request).await?;
+    Ok(Json(response))
+}
+
+async fn resolve_delivery(
+    State(state): State<AppState>,
+    Path(delivery_id): Path<i64>,
+    Json(request): Json<crate::models::ResolveDeliveryRequest>,
+) -> AppResult<Json<crate::models::ResolveDeliveryResponse>> {
+    let response = services::resolve_delivery(&state.pool, delivery_id, request).await?;
+    Ok(Json(response))
+}
+
+async fn unresolve_delivery(
+    State(state): State<AppState>,
+    Path(delivery_id): Path<i64>,
+) -> AppResult<Json<crate::models::UnresolveDeliveryResponse>> {
+    let response = services::unresolve_delivery(&state.pool, delivery_id).await?;
     Ok(Json(response))
 }
 

@@ -18,9 +18,10 @@ use crate::{
         DeliveryAttemptItem, DeliveryDetailResponse, DeliveryListItem, DeliveryListQuery,
         DeliveryRetryLineage, DeliveryTraceItem, EndpointListItem, EndpointStatsItem,
         EventFanoutDeliveryItem, EventFanoutResponse, EventListItem, EventListQuery,
-        PaginatedDeliveriesResponse, PaginatedEventsResponse, RetryBacklogSummary,
-        RetryDeliveryRequest, RetryDeliveryResponse, TraceGraphEdge, TraceGraphNode,
-        TraceGraphResponse, UpdateEndpointRequest,
+        PaginatedDeliveriesResponse, PaginatedEventsResponse, ResolveDeliveryRequest,
+        ResolveDeliveryResponse, RetryBacklogSummary, RetryDeliveryRequest, RetryDeliveryResponse,
+        TraceGraphEdge, TraceGraphNode, TraceGraphResponse, UnresolveDeliveryResponse,
+        UpdateEndpointRequest,
     },
 };
 
@@ -84,6 +85,44 @@ fn normalize_exact_filter(value: Option<String>) -> Option<String> {
     value
         .map(|value| value.trim().to_ascii_lowercase())
         .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("all"))
+}
+
+fn normalize_resolution_filter(value: Option<String>) -> AppResult<Option<String>> {
+    let Some(value) = normalize_exact_filter(value) else {
+        return Ok(None);
+    };
+
+    if matches!(value.as_str(), "resolved" | "unresolved") {
+        Ok(Some(value))
+    } else {
+        Err(AppError::BadRequest(
+            "resolution must be resolved, unresolved, or all".to_string(),
+        ))
+    }
+}
+
+fn normalize_optional_text(
+    value: Option<String>,
+    field: &str,
+    max_len: usize,
+) -> AppResult<Option<String>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+
+    if value.len() > max_len {
+        return Err(AppError::BadRequest(format!(
+            "{} must be {} characters or fewer",
+            field, max_len
+        )));
+    }
+
+    Ok(Some(value.to_string()))
 }
 
 fn endpoint_search(value: Option<&str>) -> EndpointSearch {
@@ -853,15 +892,24 @@ pub async fn list_events(
 
     let rows = sqlx::query_as::<_, EventListItem>(
         "SELECT
-            event_id,
-            merchant_id,
-            object_type,
-            object_id,
-            event_type,
-            created_at
-         FROM domain_events
-         WHERE ($1::BIGINT IS NULL OR merchant_id = $1)
-           AND ($2::TEXT IS NULL OR event_type = $2)
+            e.event_id,
+            e.merchant_id,
+            e.object_type,
+            e.object_id,
+            e.event_type,
+            e.created_at,
+            COUNT(d.delivery_id)::BIGINT AS delivery_count,
+            COUNT(d.delivery_id) FILTER (WHERE d.status = 'pending')::BIGINT AS pending_count,
+            COUNT(d.delivery_id) FILTER (WHERE d.status = 'queued')::BIGINT AS queued_count,
+            COUNT(d.delivery_id) FILTER (WHERE d.status = 'processing')::BIGINT AS processing_count,
+            COUNT(d.delivery_id) FILTER (WHERE d.status = 'retrying')::BIGINT AS retrying_count,
+            COUNT(d.delivery_id) FILTER (WHERE d.status = 'delivered')::BIGINT AS delivered_count,
+            COUNT(d.delivery_id) FILTER (WHERE d.status = 'dead_lettered')::BIGINT AS dead_lettered_count
+         FROM domain_events e
+         LEFT JOIN webhook_deliveries d
+            ON d.event_id = e.event_id
+         WHERE ($1::BIGINT IS NULL OR e.merchant_id = $1)
+           AND ($2::TEXT IS NULL OR e.event_type = $2)
            AND (
                 (
                     $3::BIGINT IS NULL
@@ -870,14 +918,15 @@ pub async fn list_events(
                     AND $6::TEXT IS NULL
                     AND $7::TEXT IS NULL
                 )
-                OR event_id = $3
-                OR merchant_id = $4
-                OR object_id = $5
-                OR event_type = $6
-                OR object_type = $7
+                OR e.event_id = $3
+                OR e.merchant_id = $4
+                OR e.object_id = $5
+                OR e.event_type = $6
+                OR e.object_type = $7
            )
-           AND ($8::BIGINT IS NULL OR event_id < $8)
-         ORDER BY event_id DESC
+           AND ($8::BIGINT IS NULL OR e.event_id < $8)
+         GROUP BY e.event_id
+         ORDER BY e.event_id DESC
          LIMIT $9",
     )
     .bind(query.merchant_id)
@@ -909,14 +958,24 @@ pub async fn list_events(
 pub async fn get_event(pool: &PgPool, event_id: i64) -> AppResult<EventListItem> {
     let event = sqlx::query_as::<_, EventListItem>(
         "SELECT
-            event_id,
-            merchant_id,
-            object_type,
-            object_id,
-            event_type,
-            created_at
-         FROM domain_events
-         WHERE event_id = $1",
+            e.event_id,
+            e.merchant_id,
+            e.object_type,
+            e.object_id,
+            e.event_type,
+            e.created_at,
+            COUNT(d.delivery_id)::BIGINT AS delivery_count,
+            COUNT(d.delivery_id) FILTER (WHERE d.status = 'pending')::BIGINT AS pending_count,
+            COUNT(d.delivery_id) FILTER (WHERE d.status = 'queued')::BIGINT AS queued_count,
+            COUNT(d.delivery_id) FILTER (WHERE d.status = 'processing')::BIGINT AS processing_count,
+            COUNT(d.delivery_id) FILTER (WHERE d.status = 'retrying')::BIGINT AS retrying_count,
+            COUNT(d.delivery_id) FILTER (WHERE d.status = 'delivered')::BIGINT AS delivered_count,
+            COUNT(d.delivery_id) FILTER (WHERE d.status = 'dead_lettered')::BIGINT AS dead_lettered_count
+         FROM domain_events e
+         LEFT JOIN webhook_deliveries d
+            ON d.event_id = e.event_id
+         WHERE e.event_id = $1
+         GROUP BY e.event_id",
     )
     .bind(event_id)
     .fetch_optional(pool)
@@ -1154,6 +1213,7 @@ pub async fn list_deliveries(
     let fetch_limit = limit + 1;
     let status = normalize_exact_filter(query.status);
     let event_type = normalize_exact_filter(query.event_type);
+    let resolution = normalize_resolution_filter(query.resolution)?;
     let search = delivery_search(query.search.as_deref());
     let endpoint = endpoint_search(query.endpoint.as_deref());
     let time_range_start = time_range_start(query.time_range.as_deref())?;
@@ -1177,6 +1237,9 @@ pub async fn list_deliveries(
                 ELSE COALESCE(d.last_error, latest.error_message)
             END AS last_error,
             d.next_attempt_at,
+            d.operator_resolved_at,
+            d.operator_resolved_by,
+            d.operator_resolution_note,
             d.created_at,
             d.updated_at
          FROM webhook_deliveries d
@@ -1230,9 +1293,14 @@ pub async fn list_deliveries(
            )
            AND ($17::TIMESTAMPTZ IS NULL OR d.created_at >= $17)
            AND ($18::BIGINT IS NULL OR d.delivery_id < $18)
+           AND (
+                $19::TEXT IS NULL
+                OR ($19 = 'resolved' AND d.operator_resolved_at IS NOT NULL)
+                OR ($19 = 'unresolved' AND d.operator_resolved_at IS NULL)
+           )
          GROUP BY d.delivery_id, e.event_type, latest.http_status, latest.outcome, latest.error_message, latest.duration_ms
          ORDER BY d.delivery_id DESC
-         LIMIT $19",
+         LIMIT $20",
     )
     .bind(query.merchant_id)
     .bind(query.endpoint_id)
@@ -1252,6 +1320,7 @@ pub async fn list_deliveries(
     .bind(search.endpoint_pattern)
     .bind(time_range_start)
     .bind(query.cursor)
+    .bind(resolution)
     .bind(fetch_limit)
     .fetch_all(pool)
     .await?;
@@ -1293,6 +1362,9 @@ pub async fn list_deliveries_for_event(
                 ELSE COALESCE(d.last_error, latest.error_message)
             END AS last_error,
             d.next_attempt_at,
+            d.operator_resolved_at,
+            d.operator_resolved_by,
+            d.operator_resolution_note,
             d.created_at,
             d.updated_at,
             endpoint.description AS endpoint_description,
@@ -1362,6 +1434,9 @@ pub async fn get_delivery(pool: &PgPool, delivery_id: i64) -> AppResult<Delivery
                 ELSE COALESCE(d.last_error, latest.error_message)
             END AS last_error,
             d.next_attempt_at,
+            d.operator_resolved_at,
+            d.operator_resolved_by,
+            d.operator_resolution_note,
             d.created_at,
             d.updated_at
          FROM webhook_deliveries d
@@ -1516,6 +1591,200 @@ pub async fn bulk_retry_deliveries(
         total_skipped: skipped.len(),
         retried,
         skipped,
+    })
+}
+
+pub async fn resolve_delivery(
+    pool: &PgPool,
+    delivery_id: i64,
+    request: ResolveDeliveryRequest,
+) -> AppResult<ResolveDeliveryResponse> {
+    let resolved_by = normalize_optional_text(request.resolved_by, "resolved_by", 200)?;
+    let note = normalize_optional_text(request.note, "note", 2_000)?;
+    let mut tx = pool.begin().await?;
+
+    let row = sqlx::query(
+        "WITH target AS (
+            SELECT
+                delivery_id,
+                operator_resolved_at IS NOT NULL AS was_already_resolved
+            FROM webhook_deliveries
+            WHERE delivery_id = $1
+              AND status = 'dead_lettered'
+            FOR UPDATE
+         ),
+         updated AS (
+            UPDATE webhook_deliveries d
+            SET operator_resolved_at = COALESCE(d.operator_resolved_at, NOW()),
+                operator_resolved_by = CASE
+                    WHEN target.was_already_resolved THEN d.operator_resolved_by
+                    ELSE $2
+                END,
+                operator_resolution_note = CASE
+                    WHEN target.was_already_resolved THEN d.operator_resolution_note
+                    ELSE $3
+                END,
+                updated_at = CASE
+                    WHEN target.was_already_resolved THEN d.updated_at
+                    ELSE NOW()
+                END
+            FROM target
+            WHERE d.delivery_id = target.delivery_id
+            RETURNING
+                d.delivery_id,
+                d.event_id,
+                d.operator_resolved_at,
+                d.operator_resolved_by,
+                d.operator_resolution_note,
+                target.was_already_resolved
+         )
+         SELECT * FROM updated",
+    )
+    .bind(delivery_id)
+    .bind(resolved_by.as_deref())
+    .bind(note.as_deref())
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    let row = match row {
+        Some(row) => row,
+        None => {
+            let status = sqlx::query_scalar::<_, String>(
+                "SELECT status FROM webhook_deliveries WHERE delivery_id = $1",
+            )
+            .bind(delivery_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+
+            return match status {
+                Some(status) => Err(AppError::BadRequest(format!(
+                    "delivery {} cannot be operator-resolved while status is {}",
+                    delivery_id, status
+                ))),
+                None => Err(AppError::NotFound(format!(
+                    "delivery {} not found",
+                    delivery_id
+                ))),
+            };
+        }
+    };
+
+    let event_id: i64 = row.get("event_id");
+    let operator_resolved_at: DateTime<Utc> = row.get("operator_resolved_at");
+    let operator_resolved_by: Option<String> = row.get("operator_resolved_by");
+    let operator_resolution_note: Option<String> = row.get("operator_resolution_note");
+    let was_already_resolved: bool = row.get("was_already_resolved");
+
+    if !was_already_resolved {
+        append_delivery_trace_in_tx(
+            &mut tx,
+            delivery_id,
+            event_id,
+            "operator_resolved",
+            "succeeded",
+            "Operator resolved dead letter",
+            json!({
+                "operator_resolved_at": operator_resolved_at,
+                "operator_resolved_by": operator_resolved_by,
+                "operator_resolution_note": operator_resolution_note
+            }),
+        )
+        .await?;
+    }
+
+    tx.commit().await?;
+
+    Ok(ResolveDeliveryResponse {
+        success: true,
+        delivery_id,
+        operator_resolved_at,
+        operator_resolved_by,
+        operator_resolution_note,
+    })
+}
+
+pub async fn unresolve_delivery(
+    pool: &PgPool,
+    delivery_id: i64,
+) -> AppResult<UnresolveDeliveryResponse> {
+    let mut tx = pool.begin().await?;
+
+    let row = sqlx::query(
+        "WITH target AS (
+            SELECT
+                delivery_id,
+                operator_resolved_at IS NOT NULL AS was_resolved
+            FROM webhook_deliveries
+            WHERE delivery_id = $1
+              AND status = 'dead_lettered'
+            FOR UPDATE
+         ),
+         updated AS (
+            UPDATE webhook_deliveries d
+            SET operator_resolved_at = NULL,
+                operator_resolved_by = NULL,
+                operator_resolution_note = NULL,
+                updated_at = CASE
+                    WHEN target.was_resolved THEN NOW()
+                    ELSE d.updated_at
+                END
+            FROM target
+            WHERE d.delivery_id = target.delivery_id
+            RETURNING d.delivery_id, d.event_id, target.was_resolved
+         )
+         SELECT * FROM updated",
+    )
+    .bind(delivery_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    let row = match row {
+        Some(row) => row,
+        None => {
+            let status = sqlx::query_scalar::<_, String>(
+                "SELECT status FROM webhook_deliveries WHERE delivery_id = $1",
+            )
+            .bind(delivery_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+
+            return match status {
+                Some(status) => Err(AppError::BadRequest(format!(
+                    "delivery {} cannot be reopened while status is {}",
+                    delivery_id, status
+                ))),
+                None => Err(AppError::NotFound(format!(
+                    "delivery {} not found",
+                    delivery_id
+                ))),
+            };
+        }
+    };
+
+    let event_id: i64 = row.get("event_id");
+    let was_resolved: bool = row.get("was_resolved");
+
+    if was_resolved {
+        append_delivery_trace_in_tx(
+            &mut tx,
+            delivery_id,
+            event_id,
+            "operator_resolution_reopened",
+            "succeeded",
+            "Operator reopened dead letter",
+            json!({}),
+        )
+        .await?;
+    }
+
+    tx.commit().await?;
+
+    Ok(UnresolveDeliveryResponse {
+        success: true,
+        delivery_id,
+        operator_resolved_at: None,
+        operator_resolved_by: None,
+        operator_resolution_note: None,
     })
 }
 
@@ -1751,6 +2020,7 @@ pub async fn list_delivery_attempts(
             outcome,
             error_message,
             response_body_sample,
+            request_body_hash,
             started_at,
             completed_at,
             duration_ms
@@ -1928,6 +2198,35 @@ mod tests {
         let search = event_search(Some("payment_succeeded"));
 
         assert_eq!(search.event_type.as_deref(), Some("payment_succeeded"));
+    }
+
+    #[test]
+    fn resolution_filter_accepts_supported_values() {
+        assert_eq!(
+            normalize_resolution_filter(Some(" unresolved ".to_string())).unwrap(),
+            Some("unresolved".to_string())
+        );
+        assert_eq!(
+            normalize_resolution_filter(Some("resolved".to_string())).unwrap(),
+            Some("resolved".to_string())
+        );
+        assert_eq!(
+            normalize_resolution_filter(Some("all".to_string())).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn optional_text_is_trimmed_and_bounded() {
+        assert_eq!(
+            normalize_optional_text(Some(" Operator ".to_string()), "resolved_by", 20).unwrap(),
+            Some("Operator".to_string())
+        );
+        assert_eq!(
+            normalize_optional_text(Some("   ".to_string()), "note", 20).unwrap(),
+            None
+        );
+        assert!(normalize_optional_text(Some("too long".to_string()), "note", 3).is_err());
     }
 
     #[test]
