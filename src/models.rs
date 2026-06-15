@@ -214,8 +214,17 @@ pub struct RetryDeliveryRequest {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RetryDeliveryResponse {
+    pub success: bool,
+    pub created: bool,
+    pub already_active_retry: bool,
     pub original_delivery_id: i64,
     pub new_delivery_id: i64,
+    pub event_id: i64,
+    pub event_type: String,
+    pub merchant_id: i64,
+    pub endpoint_id: i64,
+    pub endpoint_url: String,
+    pub new_delivery_status: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -227,6 +236,8 @@ pub struct BulkRetryDeliveriesRequest {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct BulkRetryDeliveriesResponse {
+    pub queued_count: usize,
+    pub failed_ids: Vec<i64>,
     pub retried: Vec<RetryDeliveryResponse>,
     pub skipped: Vec<BulkRetrySkip>,
     pub total_requested: usize,

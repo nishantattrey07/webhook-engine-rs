@@ -379,8 +379,20 @@ fn spawn_redis_relay(pool: PgPool, config: WorkerConfig, redis_url: String) {
             return;
         };
 
+        if let Err(error) = ensure_consumer_group(
+            &mut redis,
+            &config.redis_stream,
+            &config.redis_consumer_group,
+        )
+        .await
+        {
+            tracing::error!(%error, "failed to initialize Redis consumer group for relay");
+            return;
+        }
+
         tracing::info!(
             stream = config.redis_stream,
+            group = config.redis_consumer_group,
             poll_ms = config.poll_interval.as_millis(),
             batch_size = config.batch_size,
             "Redis delivery relay started"

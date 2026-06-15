@@ -1506,7 +1506,11 @@ pub async fn bulk_retry_deliveries(
 
     tx.commit().await?;
 
+    let failed_ids = skipped.iter().map(|item| item.delivery_id).collect();
+
     Ok(BulkRetryDeliveriesResponse {
+        queued_count: retried.len(),
+        failed_ids,
         total_requested,
         total_retried: retried.len(),
         total_skipped: skipped.len(),
@@ -1523,16 +1527,18 @@ async fn retry_delivery_in_tx(
 ) -> AppResult<RetryDeliveryResponse> {
     let original = sqlx::query(
         "SELECT
-            delivery_id,
-            event_id,
-            endpoint_id,
-            merchant_id,
-            endpoint_url,
-            secret_version_id,
-            status,
-            max_attempts
-         FROM webhook_deliveries
-         WHERE delivery_id = $1",
+            d.delivery_id,
+            d.event_id,
+            e.event_type,
+            d.endpoint_id,
+            d.merchant_id,
+            d.endpoint_url,
+            d.secret_version_id,
+            d.status,
+            d.max_attempts
+         FROM webhook_deliveries d
+         JOIN domain_events e ON e.event_id = d.event_id
+         WHERE d.delivery_id = $1",
     )
     .bind(delivery_id)
     .fetch_optional(&mut **tx)
@@ -1548,13 +1554,45 @@ async fn retry_delivery_in_tx(
     }
 
     let event_id: i64 = original.get("event_id");
+    let event_type: String = original.get("event_type");
     let endpoint_id: i64 = original.get("endpoint_id");
     let merchant_id: i64 = original.get("merchant_id");
     let endpoint_url: String = original.get("endpoint_url");
     let secret_version_id: Option<i64> = original.get("secret_version_id");
     let max_attempts: i64 = original.get("max_attempts");
 
-    let new_delivery_id: i64 = sqlx::query(
+    if let Some(active_retry) = sqlx::query(
+        "SELECT delivery_id, status
+         FROM webhook_deliveries
+         WHERE manually_retried_from_delivery_id = $1
+           AND status IN ('pending', 'queued', 'processing', 'retrying')
+         ORDER BY delivery_id DESC
+         LIMIT 1
+         FOR UPDATE",
+    )
+    .bind(delivery_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    {
+        let new_delivery_id: i64 = active_retry.get("delivery_id");
+        let new_delivery_status: String = active_retry.get("status");
+
+        return Ok(RetryDeliveryResponse {
+            success: true,
+            created: false,
+            already_active_retry: true,
+            original_delivery_id: delivery_id,
+            new_delivery_id,
+            event_id,
+            event_type,
+            merchant_id,
+            endpoint_id,
+            endpoint_url,
+            new_delivery_status,
+        });
+    }
+
+    let new_delivery = sqlx::query(
         "INSERT INTO webhook_deliveries (
             event_id,
             endpoint_id,
@@ -1585,20 +1623,22 @@ async fn retry_delivery_in_tx(
             NOW(),
             NOW()
          )
-         RETURNING delivery_id",
+         RETURNING delivery_id, status",
     )
     .bind(event_id)
     .bind(endpoint_id)
     .bind(merchant_id)
-    .bind(endpoint_url)
+    .bind(&endpoint_url)
     .bind(secret_version_id)
     .bind(max_attempts)
     .bind(delivery_id)
     .bind(reason)
     .bind(requested_by)
     .fetch_one(&mut **tx)
-    .await?
-    .get("delivery_id");
+    .await?;
+
+    let new_delivery_id: i64 = new_delivery.get("delivery_id");
+    let new_delivery_status: String = new_delivery.get("status");
 
     append_delivery_trace_in_tx(
         tx,
@@ -1607,7 +1647,15 @@ async fn retry_delivery_in_tx(
         "manual_retry_requested",
         "succeeded",
         "Manual retry requested",
-        json!({ "new_delivery_id": new_delivery_id, "reason": reason, "requested_by": requested_by }),
+        json!({
+            "created": true,
+            "event_id": event_id,
+            "event_type": event_type,
+            "new_delivery_id": new_delivery_id,
+            "new_delivery_status": new_delivery_status,
+            "reason": reason,
+            "requested_by": requested_by
+        }),
     )
     .await?;
 
@@ -1618,13 +1666,28 @@ async fn retry_delivery_in_tx(
         "delivery_created",
         "succeeded",
         "Retry delivery created",
-        json!({ "original_delivery_id": delivery_id, "reason": reason, "requested_by": requested_by }),
+        json!({
+            "original_delivery_id": delivery_id,
+            "event_id": event_id,
+            "event_type": event_type,
+            "reason": reason,
+            "requested_by": requested_by
+        }),
     )
     .await?;
 
     Ok(RetryDeliveryResponse {
+        success: true,
+        created: true,
+        already_active_retry: false,
         original_delivery_id: delivery_id,
         new_delivery_id,
+        event_id,
+        event_type,
+        merchant_id,
+        endpoint_id,
+        endpoint_url,
+        new_delivery_status,
     })
 }
 
@@ -2078,6 +2141,120 @@ mod tests {
             .map(|node| node.step.as_str())
             .collect::<Vec<_>>();
         assert_eq!(graph_steps, delivery_one_steps);
+
+        sqlx::query("DELETE FROM payments WHERE payment_id = $1")
+            .bind(payment_id)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM webhook_endpoints WHERE merchant_id = $1")
+            .bind(merchant_id)
+            .execute(&pool)
+            .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn manual_retry_returns_existing_active_child_when_test_db_is_set()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let database_url = match std::env::var("TEST_DATABASE_URL") {
+            Ok(value) => value,
+            Err(_) => {
+                eprintln!("skipping db-backed retry test; TEST_DATABASE_URL is not set");
+                return Ok(());
+            }
+        };
+
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await?;
+
+        let marker = Utc::now().timestamp_micros();
+        let merchant_id = 9_100_000_000_i64 + (marker % 1_000_000);
+        let payment_id: i64 = sqlx::query_scalar(
+            "INSERT INTO payments (merchant_id, order_id, amount, status, mode_of_payment)
+             VALUES ($1, $2, 100, 'succeeded', 'test')
+             RETURNING payment_id",
+        )
+        .bind(merchant_id)
+        .bind(marker)
+        .fetch_one(&pool)
+        .await?;
+
+        let event_id: i64 = sqlx::query_scalar(
+            "INSERT INTO domain_events (
+                merchant_id,
+                object_type,
+                object_id,
+                event_type
+             )
+             VALUES ($1, 'payment', $2, 'payment_succeeded')
+             RETURNING event_id",
+        )
+        .bind(merchant_id)
+        .bind(payment_id)
+        .fetch_one(&pool)
+        .await?;
+
+        let endpoint_id: i64 = sqlx::query_scalar(
+            "INSERT INTO webhook_endpoints (merchant_id, url, enabled, max_attempts)
+             VALUES ($1, 'http://127.0.0.1:3000/test/retry', TRUE, 5)
+             RETURNING endpoint_id",
+        )
+        .bind(merchant_id)
+        .fetch_one(&pool)
+        .await?;
+
+        let original_delivery_id: i64 = sqlx::query_scalar(
+            "INSERT INTO webhook_deliveries (
+                event_id,
+                endpoint_id,
+                merchant_id,
+                endpoint_url,
+                status,
+                max_attempts
+             )
+             VALUES ($1, $2, $3, 'http://127.0.0.1:3000/test/retry', 'dead_lettered', 5)
+             RETURNING delivery_id",
+        )
+        .bind(event_id)
+        .bind(endpoint_id)
+        .bind(merchant_id)
+        .fetch_one(&pool)
+        .await?;
+
+        let first = retry_delivery(
+            &pool,
+            original_delivery_id,
+            RetryDeliveryRequest {
+                reason: Some("test retry".to_string()),
+                requested_by: Some("test".to_string()),
+            },
+        )
+        .await?;
+
+        let second = retry_delivery(
+            &pool,
+            original_delivery_id,
+            RetryDeliveryRequest {
+                reason: Some("test retry duplicate".to_string()),
+                requested_by: Some("test".to_string()),
+            },
+        )
+        .await?;
+
+        assert!(first.success);
+        assert!(first.created);
+        assert!(!first.already_active_retry);
+        assert_eq!(first.event_id, event_id);
+        assert_eq!(first.event_type, "payment_succeeded");
+
+        assert!(second.success);
+        assert!(!second.created);
+        assert!(second.already_active_retry);
+        assert_eq!(second.new_delivery_id, first.new_delivery_id);
+        assert_eq!(second.new_delivery_status, "pending");
 
         sqlx::query("DELETE FROM payments WHERE payment_id = $1")
             .bind(payment_id)
