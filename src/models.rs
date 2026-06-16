@@ -442,7 +442,10 @@ pub struct ScenarioCatalogItem {
     pub label: String,
     pub description: String,
     pub category: String,
+    pub scenario_kind: String,
     pub config_knobs: Vec<String>,
+    pub allows_receiver_behavior: bool,
+    pub requires_receiver_behavior: bool,
     pub aliases: Vec<String>,
 }
 
@@ -499,6 +502,32 @@ pub struct ScenarioArtifacts {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct ScenarioPlannedExpectations {
+    pub payment_count: i64,
+    pub event_count: i64,
+    pub endpoint_count: i64,
+    pub delivery_count: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ScenarioPlannedEndpoint {
+    pub ordinal: i64,
+    pub endpoint_role: Option<String>,
+    pub endpoint_key: String,
+    pub behavior_key: String,
+    pub behavior: Value,
+    pub base_delay_ms: i64,
+    pub max_attempts: i64,
+    pub created_endpoint_id: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ScenarioPlanDetail {
+    pub expectations: ScenarioPlannedExpectations,
+    pub endpoints: Vec<ScenarioPlannedEndpoint>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct ScenarioDetailResponse {
     pub scenario_id: i64,
     pub scenario_key: String,
@@ -509,6 +538,7 @@ pub struct ScenarioDetailResponse {
     pub requested_by: Option<String>,
     pub summary: ScenarioSummary,
     pub artifacts: ScenarioArtifacts,
+    pub planned: Option<ScenarioPlanDetail>,
     pub receiver_config: Value,
     pub step_log: Value,
     pub error_message: Option<String>,

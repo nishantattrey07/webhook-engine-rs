@@ -20,6 +20,4 @@ tower-http = { version = "0.6", features = ["cors", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
-postgres = "0.19"
-ureq = { version = "3.3", features = ["json"] }
 dotenvy = "0.15"

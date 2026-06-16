@@ -19,6 +19,7 @@ pub async fn run_schema_bootstrap(pool: &PgPool) -> AppResult<()> {
     let schemas = [
         include_str!("../migrations/001_phase1_schema.sql"),
         include_str!("../migrations/002_delivery_search_indexes.sql"),
+        include_str!("../migrations/003_scenario_run_planning.sql"),
     ];
 
     for schema in schemas {
