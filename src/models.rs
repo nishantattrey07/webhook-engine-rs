@@ -101,6 +101,77 @@ pub struct EndpointListItem {
     pub subscribed_events: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct EndpointHealthSummary {
+    pub total_deliveries: i64,
+    pub delivered_deliveries: i64,
+    pub retrying_deliveries: i64,
+    pub dead_lettered_deliveries: i64,
+    pub last_delivery_at: Option<DateTime<Utc>>,
+    pub last_delivery_status: Option<String>,
+    pub last_http_status: Option<i16>,
+    pub success_rate: Option<f64>,
+    pub p95_latency_ms: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EndpointDetailResponse {
+    pub endpoint_id: i64,
+    pub merchant_id: i64,
+    pub url: String,
+    pub description: Option<String>,
+    pub enabled: bool,
+    pub max_attempts: i64,
+    pub active_secret_version_id: Option<i64>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub subscribed_events: Vec<String>,
+    pub delivery_health: EndpointHealthSummary,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct EndpointDeliveriesQuery {
+    pub status: Option<String>,
+    pub cursor: Option<i64>,
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct EndpointDeliveryItem {
+    pub delivery_id: i64,
+    pub event_id: i64,
+    pub event_type: String,
+    pub status: String,
+    pub attempt_count: i64,
+    pub max_attempts: i64,
+    pub last_http_status: Option<i16>,
+    pub last_outcome: Option<String>,
+    pub duration_ms: Option<i64>,
+    pub next_attempt_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PaginatedEndpointDeliveriesResponse {
+    pub items: Vec<EndpointDeliveryItem>,
+    pub next_cursor: Option<i64>,
+    pub limit: i64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TestEndpointRequest {
+    pub event_type: Option<String>,
+    pub requested_by: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TestEndpointResponse {
+    pub payment_id: i64,
+    pub event_id: i64,
+    pub delivery_ids: Vec<i64>,
+}
+
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct EventListItem {
     pub event_id: i64,
@@ -109,6 +180,7 @@ pub struct EventListItem {
     pub object_id: i64,
     pub event_type: String,
     pub created_at: DateTime<Utc>,
+    pub scenario_id: Option<i64>,
     pub delivery_count: i64,
     pub pending_count: i64,
     pub queued_count: i64,
@@ -122,6 +194,7 @@ pub struct EventListItem {
 pub struct EventListQuery {
     pub merchant_id: Option<i64>,
     pub event_type: Option<String>,
+    pub scenario_id: Option<i64>,
     pub search: Option<String>,
     pub cursor: Option<i64>,
     pub limit: Option<i64>,
@@ -150,6 +223,7 @@ pub struct DeliveryListItem {
     pub duration_ms: Option<i64>,
     pub last_error: Option<String>,
     pub next_attempt_at: Option<DateTime<Utc>>,
+    pub scenario_id: Option<i64>,
     pub operator_resolved_at: Option<DateTime<Utc>>,
     pub operator_resolved_by: Option<String>,
     pub operator_resolution_note: Option<String>,
@@ -210,6 +284,7 @@ pub struct EventFanoutDeliveryItem {
     pub duration_ms: Option<i64>,
     pub last_error: Option<String>,
     pub next_attempt_at: Option<DateTime<Utc>>,
+    pub scenario_id: Option<i64>,
     pub operator_resolved_at: Option<DateTime<Utc>>,
     pub operator_resolved_by: Option<String>,
     pub operator_resolution_note: Option<String>,
@@ -295,6 +370,7 @@ pub struct DeliveryListQuery {
     pub endpoint_id: Option<i64>,
     pub event_id: Option<i64>,
     pub event_type: Option<String>,
+    pub scenario_id: Option<i64>,
     pub endpoint: Option<String>,
     pub status: Option<String>,
     pub resolution: Option<String>,
@@ -358,6 +434,75 @@ pub struct EndpointStatsItem {
     pub retrying_deliveries: i64,
     pub dead_lettered_deliveries: i64,
     pub last_delivery_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ScenarioCatalogItem {
+    pub scenario_key: String,
+    pub label: String,
+    pub description: String,
+    pub category: String,
+    pub config_knobs: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ScenarioRunRequest {
+    pub scenario_key: String,
+    pub requested_by: Option<String>,
+    pub config: Option<ScenarioRunConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct ScenarioRunConfig {
+    pub merchant_id: Option<i64>,
+    pub payment_count: Option<i64>,
+    pub event_type: Option<String>,
+    pub endpoint_count: Option<i64>,
+    pub max_attempts: Option<i64>,
+    pub receiver_behavior: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ScenarioRunResponse {
+    pub scenario_id: i64,
+    pub scenario_key: String,
+    pub status: String,
+    pub started_at: DateTime<Utc>,
+    pub merchant_id: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ScenarioSummary {
+    pub payments_created: i64,
+    pub events_created: i64,
+    pub deliveries_created: i64,
+    pub delivered_count: i64,
+    pub retrying_count: i64,
+    pub dead_lettered_count: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ScenarioArtifacts {
+    pub payment_ids: Vec<i64>,
+    pub event_ids: Vec<i64>,
+    pub delivery_ids: Vec<i64>,
+    pub endpoint_ids: Vec<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ScenarioDetailResponse {
+    pub scenario_id: i64,
+    pub scenario_key: String,
+    pub status: String,
+    pub started_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub merchant_id: i64,
+    pub requested_by: Option<String>,
+    pub summary: ScenarioSummary,
+    pub artifacts: ScenarioArtifacts,
+    pub receiver_config: Value,
+    pub step_log: Value,
+    pub error_message: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -1,7 +1,7 @@
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
-    routing::{get, patch, post},
+    routing::{get, post},
 };
 use sqlx::PgPool;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
@@ -15,6 +15,7 @@ use crate::{
 #[derive(Clone)]
 pub struct AppState {
     pub pool: PgPool,
+    pub mock_receiver_base_url: String,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -22,14 +23,26 @@ pub fn router(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/api/health", get(health))
         .route("/api/endpoints", get(list_endpoints).post(create_endpoint))
-        .route("/api/endpoints/:endpoint_id", patch(update_endpoint))
+        .route(
+            "/api/endpoints/:endpoint_id",
+            get(get_endpoint_detail).patch(update_endpoint),
+        )
+        .route(
+            "/api/endpoints/:endpoint_id/deliveries",
+            get(list_endpoint_deliveries),
+        )
+        .route("/api/endpoints/:endpoint_id/test", post(test_endpoint))
         .route("/api/payments", post(create_payment))
         .route("/api/payments/bulk", post(create_bulk_payments))
         .route("/api/dashboard/summary", get(get_dashboard_summary))
         .route("/api/endpoints/stats", get(list_endpoint_stats))
+        .route("/api/event-types", get(list_event_types))
         .route("/api/events", get(list_events))
         .route("/api/events/:event_id", get(get_event))
         .route("/api/events/:event_id/fanout", get(get_event_fanout))
+        .route("/api/scenarios", get(list_scenarios))
+        .route("/api/scenarios/run", post(run_scenario))
+        .route("/api/scenarios/:scenario_id", get(get_scenario))
         .route("/api/deliveries", get(list_deliveries))
         .route("/api/deliveries/bulk-retry", post(bulk_retry_deliveries))
         .route("/api/deliveries/:delivery_id", get(get_delivery))
@@ -98,6 +111,14 @@ async fn list_endpoints(
     Ok(Json(endpoints))
 }
 
+async fn get_endpoint_detail(
+    State(state): State<AppState>,
+    Path(endpoint_id): Path<i64>,
+) -> AppResult<Json<crate::models::EndpointDetailResponse>> {
+    let endpoint = services::get_endpoint_detail(&state.pool, endpoint_id).await?;
+    Ok(Json(endpoint))
+}
+
 async fn update_endpoint(
     State(state): State<AppState>,
     Path(endpoint_id): Path<i64>,
@@ -107,11 +128,54 @@ async fn update_endpoint(
     Ok(Json(endpoint))
 }
 
+async fn list_endpoint_deliveries(
+    State(state): State<AppState>,
+    Path(endpoint_id): Path<i64>,
+    Query(query): Query<crate::models::EndpointDeliveriesQuery>,
+) -> AppResult<Json<crate::models::PaginatedEndpointDeliveriesResponse>> {
+    let deliveries = services::list_endpoint_deliveries(&state.pool, endpoint_id, query).await?;
+    Ok(Json(deliveries))
+}
+
+async fn test_endpoint(
+    State(state): State<AppState>,
+    Path(endpoint_id): Path<i64>,
+    Json(request): Json<crate::models::TestEndpointRequest>,
+) -> AppResult<Json<crate::models::TestEndpointResponse>> {
+    let response = services::test_endpoint(&state.pool, endpoint_id, request).await?;
+    Ok(Json(response))
+}
+
 async fn list_endpoint_stats(
     State(state): State<AppState>,
 ) -> AppResult<Json<Vec<crate::models::EndpointStatsItem>>> {
     let stats = services::list_endpoint_stats(&state.pool).await?;
     Ok(Json(stats))
+}
+
+async fn list_event_types() -> Json<Vec<&'static str>> {
+    Json(services::allowed_event_types())
+}
+
+async fn list_scenarios() -> Json<Vec<crate::models::ScenarioCatalogItem>> {
+    Json(services::scenario_catalog())
+}
+
+async fn run_scenario(
+    State(state): State<AppState>,
+    Json(request): Json<crate::models::ScenarioRunRequest>,
+) -> AppResult<Json<crate::models::ScenarioRunResponse>> {
+    let response =
+        services::run_scenario(&state.pool, &state.mock_receiver_base_url, request).await?;
+    Ok(Json(response))
+}
+
+async fn get_scenario(
+    State(state): State<AppState>,
+    Path(scenario_id): Path<i64>,
+) -> AppResult<Json<crate::models::ScenarioDetailResponse>> {
+    let scenario = services::get_scenario(&state.pool, scenario_id).await?;
+    Ok(Json(scenario))
 }
 
 async fn get_dashboard_summary(

@@ -16,12 +16,15 @@ use crate::{
         CreateBulkPaymentsRequest, CreateBulkPaymentsResponse, CreateEndpointRequest,
         CreateEndpointResponse, CreatePaymentRequest, CreatePaymentResponse, DashboardSummary,
         DeliveryAttemptItem, DeliveryDetailResponse, DeliveryListItem, DeliveryListQuery,
-        DeliveryRetryLineage, DeliveryTraceItem, EndpointListItem, EndpointStatsItem,
+        DeliveryRetryLineage, DeliveryTraceItem, EndpointDeliveriesQuery, EndpointDeliveryItem,
+        EndpointDetailResponse, EndpointHealthSummary, EndpointListItem, EndpointStatsItem,
         EventFanoutDeliveryItem, EventFanoutResponse, EventListItem, EventListQuery,
-        PaginatedDeliveriesResponse, PaginatedEventsResponse, ResolveDeliveryRequest,
-        ResolveDeliveryResponse, RetryBacklogSummary, RetryDeliveryRequest, RetryDeliveryResponse,
-        TraceGraphEdge, TraceGraphNode, TraceGraphResponse, UnresolveDeliveryResponse,
-        UpdateEndpointRequest,
+        PaginatedDeliveriesResponse, PaginatedEndpointDeliveriesResponse, PaginatedEventsResponse,
+        PaymentStatusInput, ResolveDeliveryRequest, ResolveDeliveryResponse, RetryBacklogSummary,
+        RetryDeliveryRequest, RetryDeliveryResponse, ScenarioArtifacts, ScenarioCatalogItem,
+        ScenarioDetailResponse, ScenarioRunConfig, ScenarioRunRequest, ScenarioRunResponse,
+        ScenarioSummary, TestEndpointRequest, TestEndpointResponse, TraceGraphEdge, TraceGraphNode,
+        TraceGraphResponse, UnresolveDeliveryResponse, UpdateEndpointRequest,
     },
 };
 
@@ -34,6 +37,10 @@ const DELIVERY_STATUSES: &[&str] = &[
     "delivered",
     "dead_lettered",
 ];
+
+pub fn allowed_event_types() -> Vec<&'static str> {
+    ALLOWED_EVENT_TYPES.to_vec()
+}
 const ATTEMPT_OUTCOMES: &[&str] = &[
     "success",
     "temporary_failure",
@@ -569,7 +576,7 @@ pub async fn create_payment(
     validate_payment_request(&request)?;
 
     let mut tx = pool.begin().await?;
-    let response = create_payment_in_tx(&mut tx, request).await?;
+    let response = create_payment_in_tx(&mut tx, request, None).await?;
     tx.commit().await?;
 
     Ok(response)
@@ -578,12 +585,14 @@ pub async fn create_payment(
 async fn create_payment_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     request: CreatePaymentRequest,
+    scenario_id: Option<i64>,
 ) -> AppResult<CreatePaymentResponse> {
     let status = request.status.as_db_str();
     let event_type = request.status.event_type();
 
     let payment_id: i64 = sqlx::query(
         "INSERT INTO payments (
+            scenario_id,
             merchant_id,
             order_id,
             amount,
@@ -592,9 +601,10 @@ async fn create_payment_in_tx(
             created_at,
             updated_at
          )
-         VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
+         VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())
          RETURNING payment_id",
     )
+    .bind(scenario_id)
     .bind(request.merchant_id)
     .bind(request.order_id)
     .bind(request.amount)
@@ -606,15 +616,17 @@ async fn create_payment_in_tx(
 
     let event_id: i64 = sqlx::query(
         "INSERT INTO domain_events (
+            scenario_id,
             merchant_id,
             object_type,
             object_id,
             event_type,
             created_at
          )
-         VALUES ($1, 'payment', $2, $3, NOW())
+         VALUES ($1, $2, 'payment', $3, $4, NOW())
          RETURNING event_id",
     )
+    .bind(scenario_id)
     .bind(request.merchant_id)
     .bind(payment_id)
     .bind(event_type)
@@ -639,6 +651,7 @@ async fn create_payment_in_tx(
          ),
          inserted AS (
             INSERT INTO webhook_deliveries (
+                scenario_id,
                 event_id,
                 endpoint_id,
                 merchant_id,
@@ -650,6 +663,7 @@ async fn create_payment_in_tx(
                 updated_at
             )
             SELECT
+                $4,
                 $3,
                 endpoint_id,
                 merchant_id,
@@ -667,6 +681,7 @@ async fn create_payment_in_tx(
     .bind(request.merchant_id)
     .bind(event_type)
     .bind(event_id)
+    .bind(scenario_id)
     .fetch_one(&mut **tx)
     .await?
     .get(0);
@@ -732,7 +747,7 @@ pub async fn create_bulk_payments(
     let mut tx = pool.begin().await?;
 
     for payment in request.payments {
-        let response = create_payment_in_tx(&mut tx, payment).await?;
+        let response = create_payment_in_tx(&mut tx, payment, None).await?;
         total_deliveries += response.delivery_count;
         created.push(response);
     }
@@ -898,6 +913,7 @@ pub async fn list_events(
             e.object_id,
             e.event_type,
             e.created_at,
+            e.scenario_id,
             COUNT(d.delivery_id)::BIGINT AS delivery_count,
             COUNT(d.delivery_id) FILTER (WHERE d.status = 'pending')::BIGINT AS pending_count,
             COUNT(d.delivery_id) FILTER (WHERE d.status = 'queued')::BIGINT AS queued_count,
@@ -910,6 +926,7 @@ pub async fn list_events(
             ON d.event_id = e.event_id
          WHERE ($1::BIGINT IS NULL OR e.merchant_id = $1)
            AND ($2::TEXT IS NULL OR e.event_type = $2)
+           AND ($10::BIGINT IS NULL OR e.scenario_id = $10)
            AND (
                 (
                     $3::BIGINT IS NULL
@@ -938,6 +955,7 @@ pub async fn list_events(
     .bind(search.object_type)
     .bind(query.cursor)
     .bind(fetch_limit)
+    .bind(query.scenario_id)
     .fetch_all(pool)
     .await?;
 
@@ -964,6 +982,7 @@ pub async fn get_event(pool: &PgPool, event_id: i64) -> AppResult<EventListItem>
             e.object_id,
             e.event_type,
             e.created_at,
+            e.scenario_id,
             COUNT(d.delivery_id)::BIGINT AS delivery_count,
             COUNT(d.delivery_id) FILTER (WHERE d.status = 'pending')::BIGINT AS pending_count,
             COUNT(d.delivery_id) FILTER (WHERE d.status = 'queued')::BIGINT AS queued_count,
@@ -1050,6 +1069,827 @@ pub async fn get_endpoint(pool: &PgPool, endpoint_id: i64) -> AppResult<Endpoint
     .ok_or_else(|| AppError::NotFound(format!("endpoint {} not found", endpoint_id)))?;
 
     Ok(endpoint)
+}
+
+pub async fn get_endpoint_detail(
+    pool: &PgPool,
+    endpoint_id: i64,
+) -> AppResult<EndpointDetailResponse> {
+    let endpoint = get_endpoint(pool, endpoint_id).await?;
+
+    let health = sqlx::query(
+        "WITH latest_delivery AS (
+            SELECT
+                d.delivery_id,
+                d.status,
+                d.created_at,
+                latest.http_status
+            FROM webhook_deliveries d
+            LEFT JOIN LATERAL (
+                SELECT http_status
+                FROM delivery_attempts
+                WHERE delivery_id = d.delivery_id
+                ORDER BY attempt_count DESC, attempt_id DESC
+                LIMIT 1
+            ) latest ON TRUE
+            WHERE d.endpoint_id = $1
+            ORDER BY d.created_at DESC, d.delivery_id DESC
+            LIMIT 1
+         ),
+         latency AS (
+            SELECT
+                percentile_cont(0.95) WITHIN GROUP (ORDER BY a.duration_ms)::DOUBLE PRECISION AS p95_latency_ms
+            FROM delivery_attempts a
+            WHERE a.endpoint_id = $1
+              AND a.duration_ms IS NOT NULL
+         )
+         SELECT
+            COUNT(d.delivery_id)::BIGINT AS total_deliveries,
+            COUNT(d.delivery_id) FILTER (WHERE d.status = 'delivered')::BIGINT AS delivered_deliveries,
+            COUNT(d.delivery_id) FILTER (WHERE d.status = 'retrying')::BIGINT AS retrying_deliveries,
+            COUNT(d.delivery_id) FILTER (WHERE d.status = 'dead_lettered')::BIGINT AS dead_lettered_deliveries,
+            latest_delivery.created_at AS last_delivery_at,
+            latest_delivery.status AS last_delivery_status,
+            latest_delivery.http_status AS last_http_status,
+            CASE
+                WHEN COUNT(d.delivery_id) > 0
+                THEN COUNT(d.delivery_id) FILTER (WHERE d.status = 'delivered')::DOUBLE PRECISION / COUNT(d.delivery_id)::DOUBLE PRECISION
+                ELSE NULL
+            END AS success_rate,
+            latency.p95_latency_ms
+         FROM webhook_deliveries d
+         CROSS JOIN latency
+         LEFT JOIN latest_delivery ON TRUE
+         WHERE d.endpoint_id = $1
+         GROUP BY
+            latest_delivery.created_at,
+            latest_delivery.status,
+            latest_delivery.http_status,
+            latency.p95_latency_ms",
+    )
+    .bind(endpoint_id)
+    .fetch_optional(pool)
+    .await?;
+
+    let delivery_health = match health {
+        Some(row) => EndpointHealthSummary {
+            total_deliveries: row.get("total_deliveries"),
+            delivered_deliveries: row.get("delivered_deliveries"),
+            retrying_deliveries: row.get("retrying_deliveries"),
+            dead_lettered_deliveries: row.get("dead_lettered_deliveries"),
+            last_delivery_at: row.get("last_delivery_at"),
+            last_delivery_status: row.get("last_delivery_status"),
+            last_http_status: row.get("last_http_status"),
+            success_rate: row.get("success_rate"),
+            p95_latency_ms: row.get("p95_latency_ms"),
+        },
+        None => EndpointHealthSummary {
+            total_deliveries: 0,
+            delivered_deliveries: 0,
+            retrying_deliveries: 0,
+            dead_lettered_deliveries: 0,
+            last_delivery_at: None,
+            last_delivery_status: None,
+            last_http_status: None,
+            success_rate: None,
+            p95_latency_ms: None,
+        },
+    };
+
+    Ok(EndpointDetailResponse {
+        endpoint_id: endpoint.endpoint_id,
+        merchant_id: endpoint.merchant_id,
+        url: endpoint.url,
+        description: endpoint.description,
+        enabled: endpoint.enabled,
+        max_attempts: endpoint.max_attempts,
+        active_secret_version_id: endpoint.active_secret_version_id,
+        created_at: endpoint.created_at,
+        updated_at: endpoint.updated_at,
+        subscribed_events: endpoint.subscribed_events,
+        delivery_health,
+    })
+}
+
+pub async fn list_endpoint_deliveries(
+    pool: &PgPool,
+    endpoint_id: i64,
+    query: EndpointDeliveriesQuery,
+) -> AppResult<PaginatedEndpointDeliveriesResponse> {
+    get_endpoint(pool, endpoint_id).await?;
+
+    let limit = query.limit.unwrap_or(50).clamp(1, 100);
+    let fetch_limit = limit + 1;
+    let status = normalize_exact_filter(query.status);
+
+    let rows = sqlx::query_as::<_, EndpointDeliveryItem>(
+        "SELECT
+            d.delivery_id,
+            d.event_id,
+            e.event_type,
+            d.status,
+            COUNT(a.attempt_id)::BIGINT AS attempt_count,
+            d.max_attempts,
+            latest.http_status AS last_http_status,
+            latest.outcome AS last_outcome,
+            latest.duration_ms,
+            d.next_attempt_at,
+            d.created_at,
+            d.updated_at
+         FROM webhook_deliveries d
+         INNER JOIN domain_events e
+            ON e.event_id = d.event_id
+         LEFT JOIN delivery_attempts a
+            ON a.delivery_id = d.delivery_id
+         LEFT JOIN LATERAL (
+            SELECT
+                http_status,
+                outcome,
+                duration_ms
+            FROM delivery_attempts
+            WHERE delivery_id = d.delivery_id
+            ORDER BY attempt_count DESC, attempt_id DESC
+            LIMIT 1
+         ) latest ON TRUE
+         WHERE d.endpoint_id = $1
+           AND ($2::TEXT IS NULL OR d.status = $2)
+           AND ($3::BIGINT IS NULL OR d.delivery_id < $3)
+         GROUP BY d.delivery_id, e.event_type, latest.http_status, latest.outcome, latest.duration_ms
+         ORDER BY d.delivery_id DESC
+         LIMIT $4",
+    )
+    .bind(endpoint_id)
+    .bind(status)
+    .bind(query.cursor)
+    .bind(fetch_limit)
+    .fetch_all(pool)
+    .await?;
+
+    let mut items = rows;
+    let next_cursor = if items.len() > limit as usize {
+        items.pop().map(|item| item.delivery_id)
+    } else {
+        None
+    };
+
+    Ok(PaginatedEndpointDeliveriesResponse {
+        items,
+        next_cursor,
+        limit,
+    })
+}
+
+pub async fn test_endpoint(
+    pool: &PgPool,
+    endpoint_id: i64,
+    request: TestEndpointRequest,
+) -> AppResult<TestEndpointResponse> {
+    let requested_by = normalize_optional_text(request.requested_by, "requested_by", 200)?;
+    let endpoint = get_endpoint(pool, endpoint_id).await?;
+
+    if !endpoint.enabled {
+        return Err(AppError::BadRequest(format!(
+            "endpoint {} is disabled; enable it before sending a test delivery",
+            endpoint_id
+        )));
+    }
+
+    let event_type = request
+        .event_type
+        .or_else(|| endpoint.subscribed_events.first().cloned())
+        .ok_or_else(|| AppError::BadRequest("endpoint has no subscribed events".to_string()))?;
+
+    if !endpoint.subscribed_events.contains(&event_type) {
+        return Err(AppError::BadRequest(format!(
+            "endpoint {} is not subscribed to {}",
+            endpoint_id, event_type
+        )));
+    }
+
+    let (payment_status, amount) = payment_status_for_event_type(&event_type)?;
+    let order_id = Utc::now().timestamp_micros();
+    let mut tx = pool.begin().await?;
+
+    let payment_id: i64 = sqlx::query(
+        "INSERT INTO payments (
+            merchant_id,
+            order_id,
+            amount,
+            status,
+            mode_of_payment,
+            created_at,
+            updated_at
+         )
+         VALUES ($1, $2, $3, $4, 'endpoint_test', NOW(), NOW())
+         RETURNING payment_id",
+    )
+    .bind(endpoint.merchant_id)
+    .bind(order_id)
+    .bind(amount)
+    .bind(payment_status)
+    .fetch_one(&mut *tx)
+    .await?
+    .get(0);
+
+    let event_id: i64 = sqlx::query(
+        "INSERT INTO domain_events (
+            merchant_id,
+            object_type,
+            object_id,
+            event_type,
+            created_at
+         )
+         VALUES ($1, 'payment', $2, $3, NOW())
+         RETURNING event_id",
+    )
+    .bind(endpoint.merchant_id)
+    .bind(payment_id)
+    .bind(&event_type)
+    .fetch_one(&mut *tx)
+    .await?
+    .get(0);
+
+    let delivery_id: i64 = sqlx::query(
+        "INSERT INTO webhook_deliveries (
+            event_id,
+            endpoint_id,
+            merchant_id,
+            endpoint_url,
+            secret_version_id,
+            status,
+            max_attempts,
+            created_at,
+            updated_at
+         )
+         VALUES ($1, $2, $3, $4, $5, 'pending', $6, NOW(), NOW())
+         RETURNING delivery_id",
+    )
+    .bind(event_id)
+    .bind(endpoint.endpoint_id)
+    .bind(endpoint.merchant_id)
+    .bind(&endpoint.url)
+    .bind(endpoint.active_secret_version_id)
+    .bind(endpoint.max_attempts)
+    .fetch_one(&mut *tx)
+    .await?
+    .get(0);
+
+    append_event_level_trace(&mut tx, event_id, "payment_committed", "Payment committed").await?;
+    append_event_level_trace(
+        &mut tx,
+        event_id,
+        "domain_event_created",
+        "Domain event created",
+    )
+    .await?;
+    append_delivery_trace_in_tx(
+        &mut tx,
+        delivery_id,
+        event_id,
+        "delivery_created",
+        "succeeded",
+        "Endpoint test delivery created",
+        json!({
+            "endpoint_id": endpoint.endpoint_id,
+            "endpoint_url": endpoint.url,
+            "requested_by": requested_by,
+            "source": "endpoint_test"
+        }),
+    )
+    .await?;
+
+    tx.commit().await?;
+
+    Ok(TestEndpointResponse {
+        payment_id,
+        event_id,
+        delivery_ids: vec![delivery_id],
+    })
+}
+
+fn payment_status_for_event_type(event_type: &str) -> AppResult<(&'static str, i64)> {
+    match event_type {
+        "payment_succeeded" => Ok(("succeeded", 100)),
+        "payment_failed" => Ok(("failed", 0)),
+        "payment_refund" => Ok(("refunded", 100)),
+        _ => Err(AppError::BadRequest(format!(
+            "unsupported event type {}",
+            event_type
+        ))),
+    }
+}
+
+fn payment_status_input_for_event_type(event_type: &str) -> AppResult<PaymentStatusInput> {
+    match event_type {
+        "payment_succeeded" => Ok(PaymentStatusInput::Succeeded),
+        "payment_failed" => Ok(PaymentStatusInput::Failed),
+        "payment_refund" => Ok(PaymentStatusInput::Refunded),
+        _ => Err(AppError::BadRequest(format!(
+            "unsupported event type {}",
+            event_type
+        ))),
+    }
+}
+
+pub fn scenario_catalog() -> Vec<ScenarioCatalogItem> {
+    vec![
+        scenario_catalog_item(
+            "success",
+            "Successful delivery",
+            "Creates one endpoint and one payment event that should deliver successfully.",
+            "happy_path",
+        ),
+        scenario_catalog_item(
+            "always_500",
+            "Temporary failures to DLQ",
+            "Creates an endpoint that always returns HTTP 500 so retries can be inspected.",
+            "failure",
+        ),
+        scenario_catalog_item(
+            "timeout",
+            "Timeout delivery",
+            "Creates an endpoint that times out before eventually exhausting retry budget.",
+            "failure",
+        ),
+        scenario_catalog_item(
+            "permanent_400",
+            "Permanent failure",
+            "Creates an endpoint that returns HTTP 400 and dead-letters immediately.",
+            "failure",
+        ),
+        scenario_catalog_item(
+            "rate_limit_429",
+            "Rate limit then success",
+            "Creates an endpoint that returns 429 once and then succeeds.",
+            "retry",
+        ),
+        scenario_catalog_item(
+            "fail_then_succeed",
+            "Retry recovery",
+            "Creates an endpoint that fails once with 500 and then succeeds.",
+            "retry",
+        ),
+        scenario_catalog_item(
+            "fanout_mixed",
+            "Mixed fan-out",
+            "Creates multiple endpoints for one event: success, retrying, and permanent failure.",
+            "fanout",
+        ),
+    ]
+}
+
+fn scenario_catalog_item(
+    scenario_key: &str,
+    label: &str,
+    description: &str,
+    category: &str,
+) -> ScenarioCatalogItem {
+    ScenarioCatalogItem {
+        scenario_key: scenario_key.to_string(),
+        label: label.to_string(),
+        description: description.to_string(),
+        category: category.to_string(),
+        config_knobs: vec![
+            "merchant_id".to_string(),
+            "payment_count".to_string(),
+            "event_type".to_string(),
+            "endpoint_count".to_string(),
+            "max_attempts".to_string(),
+            "receiver_behavior".to_string(),
+        ],
+    }
+}
+
+struct ScenarioEndpointSpec {
+    endpoint_key: String,
+    description: String,
+    behavior: serde_json::Value,
+    secret: String,
+    max_attempts: i64,
+    event_types: Vec<String>,
+    base_delay_ms: i64,
+}
+
+pub async fn run_scenario(
+    pool: &PgPool,
+    receiver_base_url: &str,
+    request: ScenarioRunRequest,
+) -> AppResult<ScenarioRunResponse> {
+    let scenario_key = request.scenario_key.trim().to_ascii_lowercase();
+    if !scenario_catalog()
+        .iter()
+        .any(|item| item.scenario_key == scenario_key)
+    {
+        return Err(AppError::BadRequest(format!(
+            "unsupported scenario {}",
+            request.scenario_key
+        )));
+    }
+
+    let config = request.config.unwrap_or_default();
+    let event_type = config
+        .event_type
+        .clone()
+        .unwrap_or_else(|| "payment_succeeded".to_string());
+    payment_status_input_for_event_type(&event_type)?;
+
+    let merchant_id = config
+        .merchant_id
+        .unwrap_or_else(|| 700_000_000 + (Utc::now().timestamp_micros() % 100_000_000));
+    let requested_by = normalize_optional_text(request.requested_by, "requested_by", 200)?;
+    let config_json = serde_json::to_value(&config).unwrap_or_else(|_| json!({}));
+
+    let row = sqlx::query(
+        "INSERT INTO scenarios (
+            scenario_key,
+            status,
+            requested_by,
+            merchant_id,
+            config_json,
+            started_at
+         )
+         VALUES ($1, 'running', $2, $3, $4, NOW())
+         RETURNING scenario_id, started_at",
+    )
+    .bind(&scenario_key)
+    .bind(requested_by.as_deref())
+    .bind(merchant_id)
+    .bind(config_json)
+    .fetch_one(pool)
+    .await?;
+
+    let scenario_id: i64 = row.get("scenario_id");
+    let started_at: DateTime<Utc> = row.get("started_at");
+
+    if let Err(error) = setup_scenario(
+        pool,
+        receiver_base_url,
+        scenario_id,
+        &scenario_key,
+        merchant_id,
+        &config,
+    )
+    .await
+    {
+        let message = error.to_string();
+        sqlx::query(
+            "UPDATE scenarios
+             SET status = 'failed',
+                 error_message = $2,
+                 completed_at = NOW()
+             WHERE scenario_id = $1",
+        )
+        .bind(scenario_id)
+        .bind(&message)
+        .execute(pool)
+        .await?;
+        return Err(error);
+    }
+
+    Ok(ScenarioRunResponse {
+        scenario_id,
+        scenario_key,
+        status: "running".to_string(),
+        started_at,
+        merchant_id,
+    })
+}
+
+async fn setup_scenario(
+    pool: &PgPool,
+    receiver_base_url: &str,
+    scenario_id: i64,
+    scenario_key: &str,
+    merchant_id: i64,
+    config: &ScenarioRunConfig,
+) -> AppResult<()> {
+    let event_type = config
+        .event_type
+        .clone()
+        .unwrap_or_else(|| "payment_succeeded".to_string());
+    let payment_status = payment_status_input_for_event_type(&event_type)?;
+    let payment_count = config.payment_count.unwrap_or(1).clamp(1, 100);
+    let specs = scenario_endpoint_specs(scenario_key, config, &event_type)?;
+    let mut receiver_configs = Vec::with_capacity(specs.len());
+    let mut step_log = Vec::new();
+
+    for spec in &specs {
+        configure_mock_receiver_endpoint(receiver_base_url, merchant_id, spec).await?;
+        receiver_configs.push(json!({
+            "merchant_id": merchant_id,
+            "endpoint_key": spec.endpoint_key,
+            "behavior": spec.behavior,
+            "base_delay_ms": spec.base_delay_ms
+        }));
+
+        let response = create_endpoint(
+            pool,
+            CreateEndpointRequest {
+                merchant_id,
+                url: format!(
+                    "{}/webhook/{}/{}",
+                    receiver_base_url.trim_end_matches('/'),
+                    merchant_id,
+                    spec.endpoint_key
+                ),
+                secret: spec.secret.clone(),
+                description: Some(spec.description.clone()),
+                max_attempts: Some(spec.max_attempts),
+                subscribed_events: spec.event_types.clone(),
+            },
+        )
+        .await?;
+
+        step_log.push(json!({
+            "step": "endpoint_created",
+            "endpoint_id": response.endpoint_id,
+            "endpoint_key": spec.endpoint_key
+        }));
+    }
+
+    let mut tx = pool.begin().await?;
+    for index in 0..payment_count {
+        let created = create_payment_in_tx(
+            &mut tx,
+            CreatePaymentRequest {
+                merchant_id,
+                order_id: Utc::now().timestamp_micros() + index,
+                amount: 1_000 + index,
+                status: payment_status.clone(),
+                mode_of_payment: "scenario_lab".to_string(),
+            },
+            Some(scenario_id),
+        )
+        .await?;
+        step_log.push(json!({
+            "step": "payment_created",
+            "payment_id": created.payment_id,
+            "event_id": created.event_id,
+            "delivery_count": created.delivery_count
+        }));
+    }
+    tx.commit().await?;
+
+    sqlx::query(
+        "UPDATE scenarios
+         SET receiver_config_json = $2,
+             step_log_json = $3
+         WHERE scenario_id = $1",
+    )
+    .bind(scenario_id)
+    .bind(json!(receiver_configs))
+    .bind(json!(step_log))
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+fn scenario_endpoint_specs(
+    scenario_key: &str,
+    config: &ScenarioRunConfig,
+    event_type: &str,
+) -> AppResult<Vec<ScenarioEndpointSpec>> {
+    let max_attempts = validate_max_attempts(config.max_attempts)?;
+    let behavior_override = config.receiver_behavior.as_deref();
+
+    let behavior_for = |default_behavior: serde_json::Value| -> serde_json::Value {
+        behavior_override
+            .and_then(receiver_behavior_json)
+            .unwrap_or(default_behavior)
+    };
+
+    let spec = |key: &str,
+                description: &str,
+                behavior: serde_json::Value,
+                attempts: i64|
+     -> ScenarioEndpointSpec {
+        ScenarioEndpointSpec {
+            endpoint_key: key.to_string(),
+            description: description.to_string(),
+            behavior,
+            secret: format!("whsec_scenario_{}_{}", scenario_key, key),
+            max_attempts: attempts,
+            event_types: vec![event_type.to_string()],
+            base_delay_ms: 20,
+        }
+    };
+
+    let specs = match scenario_key {
+        "success" => vec![spec(
+            "success",
+            "scenario:success",
+            behavior_for(json!({ "type": "always_succeed" })),
+            max_attempts,
+        )],
+        "always_500" => vec![spec(
+            "server-error",
+            "scenario:always_500",
+            behavior_for(json!({ "type": "always_fail", "status": 500 })),
+            config.max_attempts.unwrap_or(2).clamp(1, 20),
+        )],
+        "timeout" => vec![spec(
+            "timeout",
+            "scenario:timeout",
+            behavior_for(json!({ "type": "always_timeout", "delay_ms": 30_000 })),
+            config.max_attempts.unwrap_or(2).clamp(1, 20),
+        )],
+        "permanent_400" => vec![spec(
+            "bad-request",
+            "scenario:permanent_400",
+            behavior_for(json!({ "type": "always_fail", "status": 400 })),
+            max_attempts,
+        )],
+        "rate_limit_429" => vec![spec(
+            "rate-limit",
+            "scenario:rate_limit_429",
+            behavior_for(json!({ "type": "sequence", "statuses": [429, 200] })),
+            max_attempts,
+        )],
+        "fail_then_succeed" => vec![spec(
+            "retry-success",
+            "scenario:fail_then_succeed",
+            behavior_for(
+                json!({ "type": "fail_first_n_then_succeed", "failures": 1, "status": 500 }),
+            ),
+            max_attempts,
+        )],
+        "fanout_mixed" => vec![
+            spec(
+                "accounting",
+                "scenario:fanout_mixed:accounting",
+                json!({ "type": "always_succeed" }),
+                max_attempts,
+            ),
+            spec(
+                "crm",
+                "scenario:fanout_mixed:crm",
+                json!({ "type": "always_fail", "status": 500 }),
+                config.max_attempts.unwrap_or(5).clamp(1, 20),
+            ),
+            spec(
+                "analytics",
+                "scenario:fanout_mixed:analytics",
+                json!({ "type": "always_fail", "status": 400 }),
+                max_attempts,
+            ),
+        ],
+        _ => {
+            return Err(AppError::BadRequest(format!(
+                "unsupported scenario {}",
+                scenario_key
+            )));
+        }
+    };
+
+    Ok(specs)
+}
+
+fn receiver_behavior_json(value: &str) -> Option<serde_json::Value> {
+    match value {
+        "success" => Some(json!({ "type": "always_succeed" })),
+        "always_500" => Some(json!({ "type": "always_fail", "status": 500 })),
+        "timeout" => Some(json!({ "type": "always_timeout", "delay_ms": 30_000 })),
+        "permanent_400" => Some(json!({ "type": "always_fail", "status": 400 })),
+        "rate_limit_429" => Some(json!({ "type": "sequence", "statuses": [429, 200] })),
+        "fail_then_succeed" => {
+            Some(json!({ "type": "fail_first_n_then_succeed", "failures": 1, "status": 500 }))
+        }
+        _ => None,
+    }
+}
+
+async fn configure_mock_receiver_endpoint(
+    receiver_base_url: &str,
+    merchant_id: i64,
+    spec: &ScenarioEndpointSpec,
+) -> AppResult<()> {
+    let url = format!(
+        "{}/admin/endpoints",
+        receiver_base_url.trim_end_matches('/')
+    );
+    let response = reqwest::Client::new()
+        .post(url)
+        .json(&json!({
+            "merchant_id": merchant_id,
+            "endpoint_key": spec.endpoint_key,
+            "behavior": spec.behavior,
+            "base_delay_ms": spec.base_delay_ms,
+            "secret": spec.secret,
+            "verify_signature": true,
+            "enabled": true
+        }))
+        .send()
+        .await
+        .map_err(|error| AppError::BadRequest(format!("mock receiver is unreachable: {error}")))?;
+
+    if !response.status().is_success() {
+        return Err(AppError::BadRequest(format!(
+            "mock receiver endpoint configuration failed with status {}",
+            response.status()
+        )));
+    }
+
+    Ok(())
+}
+
+pub async fn get_scenario(pool: &PgPool, scenario_id: i64) -> AppResult<ScenarioDetailResponse> {
+    let scenario = sqlx::query(
+        "SELECT
+            scenario_id,
+            scenario_key,
+            status,
+            requested_by,
+            merchant_id,
+            receiver_config_json,
+            step_log_json,
+            error_message,
+            started_at,
+            completed_at
+         FROM scenarios
+         WHERE scenario_id = $1",
+    )
+    .bind(scenario_id)
+    .fetch_optional(pool)
+    .await?
+    .ok_or_else(|| AppError::NotFound(format!("scenario {} not found", scenario_id)))?;
+
+    let summary_row = sqlx::query(
+        "SELECT
+            (SELECT COUNT(*)::BIGINT FROM payments WHERE scenario_id = $1) AS payments_created,
+            (SELECT COUNT(*)::BIGINT FROM domain_events WHERE scenario_id = $1) AS events_created,
+            COUNT(d.delivery_id)::BIGINT AS deliveries_created,
+            COUNT(d.delivery_id) FILTER (WHERE d.status = 'delivered')::BIGINT AS delivered_count,
+            COUNT(d.delivery_id) FILTER (WHERE d.status = 'retrying')::BIGINT AS retrying_count,
+            COUNT(d.delivery_id) FILTER (WHERE d.status = 'dead_lettered')::BIGINT AS dead_lettered_count,
+            COUNT(d.delivery_id) FILTER (WHERE d.status IN ('pending', 'queued', 'processing', 'retrying'))::BIGINT AS active_count
+         FROM webhook_deliveries d
+         WHERE d.scenario_id = $1",
+    )
+    .bind(scenario_id)
+    .fetch_one(pool)
+    .await?;
+
+    let artifacts_row = sqlx::query(
+        "SELECT
+            COALESCE((SELECT array_agg(payment_id ORDER BY payment_id) FROM payments WHERE scenario_id = $1), ARRAY[]::BIGINT[]) AS payment_ids,
+            COALESCE((SELECT array_agg(event_id ORDER BY event_id) FROM domain_events WHERE scenario_id = $1), ARRAY[]::BIGINT[]) AS event_ids,
+            COALESCE((SELECT array_agg(delivery_id ORDER BY delivery_id) FROM webhook_deliveries WHERE scenario_id = $1), ARRAY[]::BIGINT[]) AS delivery_ids,
+            COALESCE((SELECT array_agg(DISTINCT endpoint_id ORDER BY endpoint_id) FROM webhook_deliveries WHERE scenario_id = $1), ARRAY[]::BIGINT[]) AS endpoint_ids",
+    )
+    .bind(scenario_id)
+    .fetch_one(pool)
+    .await?;
+
+    let db_status: String = scenario.get("status");
+    let active_count: i64 = summary_row.get("active_count");
+    let deliveries_created: i64 = summary_row.get("deliveries_created");
+    let computed_status = if db_status == "failed" {
+        "failed"
+    } else if deliveries_created > 0 && active_count == 0 {
+        "completed"
+    } else {
+        "running"
+    };
+
+    if computed_status == "completed" && db_status != "completed" {
+        sqlx::query(
+            "UPDATE scenarios
+             SET status = 'completed',
+                 completed_at = COALESCE(completed_at, NOW())
+             WHERE scenario_id = $1",
+        )
+        .bind(scenario_id)
+        .execute(pool)
+        .await?;
+    }
+
+    Ok(ScenarioDetailResponse {
+        scenario_id,
+        scenario_key: scenario.get("scenario_key"),
+        status: computed_status.to_string(),
+        started_at: scenario.get("started_at"),
+        completed_at: scenario.get("completed_at"),
+        merchant_id: scenario.get("merchant_id"),
+        requested_by: scenario.get("requested_by"),
+        summary: ScenarioSummary {
+            payments_created: summary_row.get("payments_created"),
+            events_created: summary_row.get("events_created"),
+            deliveries_created,
+            delivered_count: summary_row.get("delivered_count"),
+            retrying_count: summary_row.get("retrying_count"),
+            dead_lettered_count: summary_row.get("dead_lettered_count"),
+        },
+        artifacts: ScenarioArtifacts {
+            payment_ids: artifacts_row.get("payment_ids"),
+            event_ids: artifacts_row.get("event_ids"),
+            delivery_ids: artifacts_row.get("delivery_ids"),
+            endpoint_ids: artifacts_row.get("endpoint_ids"),
+        },
+        receiver_config: scenario.get("receiver_config_json"),
+        step_log: scenario.get("step_log_json"),
+        error_message: scenario.get("error_message"),
+    })
 }
 
 pub async fn list_endpoint_stats(pool: &PgPool) -> AppResult<Vec<EndpointStatsItem>> {
@@ -1237,6 +2077,7 @@ pub async fn list_deliveries(
                 ELSE COALESCE(d.last_error, latest.error_message)
             END AS last_error,
             d.next_attempt_at,
+            d.scenario_id,
             d.operator_resolved_at,
             d.operator_resolved_by,
             d.operator_resolution_note,
@@ -1293,6 +2134,7 @@ pub async fn list_deliveries(
            )
            AND ($17::TIMESTAMPTZ IS NULL OR d.created_at >= $17)
            AND ($18::BIGINT IS NULL OR d.delivery_id < $18)
+           AND ($21::BIGINT IS NULL OR d.scenario_id = $21)
            AND (
                 $19::TEXT IS NULL
                 OR ($19 = 'resolved' AND d.operator_resolved_at IS NOT NULL)
@@ -1322,6 +2164,7 @@ pub async fn list_deliveries(
     .bind(query.cursor)
     .bind(resolution)
     .bind(fetch_limit)
+    .bind(query.scenario_id)
     .fetch_all(pool)
     .await?;
 
@@ -1362,6 +2205,7 @@ pub async fn list_deliveries_for_event(
                 ELSE COALESCE(d.last_error, latest.error_message)
             END AS last_error,
             d.next_attempt_at,
+            d.scenario_id,
             d.operator_resolved_at,
             d.operator_resolved_by,
             d.operator_resolution_note,
@@ -1434,6 +2278,7 @@ pub async fn get_delivery(pool: &PgPool, delivery_id: i64) -> AppResult<Delivery
                 ELSE COALESCE(d.last_error, latest.error_message)
             END AS last_error,
             d.next_attempt_at,
+            d.scenario_id,
             d.operator_resolved_at,
             d.operator_resolved_by,
             d.operator_resolution_note,

@@ -17,7 +17,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     delivery_worker::spawn(pool.clone(), delivery_worker::WorkerConfig::from_env());
 
-    let app = api::router(api::AppState { pool });
+    let app = api::router(api::AppState {
+        pool,
+        mock_receiver_base_url: config.mock_receiver_base_url,
+    });
     let listener = tokio::net::TcpListener::bind(config.bind_addr).await?;
 
     tracing::info!(

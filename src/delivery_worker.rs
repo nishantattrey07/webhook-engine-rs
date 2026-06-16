@@ -109,8 +109,8 @@ impl WorkerConfig {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum DeliveryTransport {
-    #[default]
     Postgres,
+    #[default]
     Redis,
 }
 
