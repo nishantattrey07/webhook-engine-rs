@@ -443,6 +443,15 @@ pub struct ScenarioCatalogItem {
     pub description: String,
     pub category: String,
     pub config_knobs: Vec<String>,
+    pub aliases: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ReceiverBehaviorOption {
+    pub receiver_behavior: String,
+    pub label: String,
+    pub description: String,
+    pub aliases: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

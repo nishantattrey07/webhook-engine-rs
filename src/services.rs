@@ -24,7 +24,8 @@ use crate::{
         RetryDeliveryRequest, RetryDeliveryResponse, ScenarioArtifacts, ScenarioCatalogItem,
         ScenarioDetailResponse, ScenarioRunConfig, ScenarioRunRequest, ScenarioRunResponse,
         ScenarioSummary, TestEndpointRequest, TestEndpointResponse, TraceGraphEdge, TraceGraphNode,
-        TraceGraphResponse, UnresolveDeliveryResponse, UpdateEndpointRequest,
+    TraceGraphResponse, UnresolveDeliveryResponse, UpdateEndpointRequest,
+    ReceiverBehaviorOption,
     },
 };
 
@@ -853,6 +854,18 @@ fn validate_max_attempts(max_attempts: Option<i64>) -> AppResult<i64> {
     Ok(max_attempts)
 }
 
+fn validate_endpoint_count(endpoint_count: Option<i64>, default_value: i64) -> AppResult<i64> {
+    let endpoint_count = endpoint_count.unwrap_or(default_value);
+
+    if !(1..=20).contains(&endpoint_count) {
+        return Err(AppError::BadRequest(
+            "endpoint_count must be between 1 and 20".to_string(),
+        ));
+    }
+
+    Ok(endpoint_count)
+}
+
 fn validate_payment_request(request: &CreatePaymentRequest) -> AppResult<()> {
     if request.amount < 0 {
         return Err(AppError::BadRequest(
@@ -1394,46 +1407,53 @@ fn payment_status_input_for_event_type(event_type: &str) -> AppResult<PaymentSta
 pub fn scenario_catalog() -> Vec<ScenarioCatalogItem> {
     vec![
         scenario_catalog_item(
-            "success",
+            "successful_delivery",
             "Successful delivery",
             "Creates one endpoint and one payment event that should deliver successfully.",
             "happy_path",
+            &["success"],
         ),
         scenario_catalog_item(
-            "always_500",
+            "persistent_server_errors",
             "Temporary failures to DLQ",
             "Creates an endpoint that always returns HTTP 500 so retries can be inspected.",
             "failure",
+            &["always_500"],
         ),
         scenario_catalog_item(
-            "timeout",
+            "delivery_timeout",
             "Timeout delivery",
             "Creates an endpoint that times out before eventually exhausting retry budget.",
             "failure",
+            &["timeout"],
         ),
         scenario_catalog_item(
-            "permanent_400",
+            "client_error_dead_letter",
             "Permanent failure",
             "Creates an endpoint that returns HTTP 400 and dead-letters immediately.",
             "failure",
+            &["permanent_400"],
         ),
         scenario_catalog_item(
-            "rate_limit_429",
+            "rate_limited_then_success",
             "Rate limit then success",
             "Creates an endpoint that returns 429 once and then succeeds.",
             "retry",
+            &["rate_limit_429"],
         ),
         scenario_catalog_item(
-            "fail_then_succeed",
+            "retry_then_success",
             "Retry recovery",
             "Creates an endpoint that fails once with 500 and then succeeds.",
             "retry",
+            &["fail_then_succeed"],
         ),
         scenario_catalog_item(
-            "fanout_mixed",
+            "mixed_endpoint_outcomes",
             "Mixed fan-out",
             "Creates multiple endpoints for one event: success, retrying, and permanent failure.",
             "fanout",
+            &["fanout_mixed"],
         ),
     ]
 }
@@ -1443,6 +1463,7 @@ fn scenario_catalog_item(
     label: &str,
     description: &str,
     category: &str,
+    aliases: &[&str],
 ) -> ScenarioCatalogItem {
     ScenarioCatalogItem {
         scenario_key: scenario_key.to_string(),
@@ -1457,6 +1478,62 @@ fn scenario_catalog_item(
             "max_attempts".to_string(),
             "receiver_behavior".to_string(),
         ],
+        aliases: aliases.iter().map(|alias| alias.to_string()).collect(),
+    }
+}
+
+pub fn receiver_behavior_catalog() -> Vec<ReceiverBehaviorOption> {
+    vec![
+        receiver_behavior_option(
+            "deliver_successfully",
+            "Deliver successfully",
+            "Receiver always returns HTTP 200.",
+            &["success"],
+        ),
+        receiver_behavior_option(
+            "return_server_error",
+            "Return server error",
+            "Receiver always returns HTTP 500.",
+            &["always_500"],
+        ),
+        receiver_behavior_option(
+            "simulate_timeout",
+            "Simulate timeout",
+            "Receiver delays long enough for the delivery request to time out.",
+            &["timeout"],
+        ),
+        receiver_behavior_option(
+            "return_client_error",
+            "Return client error",
+            "Receiver always returns HTTP 400.",
+            &["permanent_400"],
+        ),
+        receiver_behavior_option(
+            "rate_limit_then_succeed",
+            "Rate limit then succeed",
+            "Receiver returns HTTP 429 once, then succeeds.",
+            &["rate_limit_429"],
+        ),
+        receiver_behavior_option(
+            "fail_once_then_succeed",
+            "Fail once then succeed",
+            "Receiver returns HTTP 500 once, then succeeds.",
+            &["fail_then_succeed"],
+        ),
+    ]
+}
+
+fn receiver_behavior_option(
+    receiver_behavior: &str,
+    label: &str,
+    description: &str,
+    aliases: &[&str],
+) -> ReceiverBehaviorOption {
+    ReceiverBehaviorOption {
+        receiver_behavior: receiver_behavior.to_string(),
+        label: label.to_string(),
+        description: description.to_string(),
+        aliases: aliases.iter().map(|alias| alias.to_string()).collect(),
     }
 }
 
@@ -1475,16 +1552,8 @@ pub async fn run_scenario(
     receiver_base_url: &str,
     request: ScenarioRunRequest,
 ) -> AppResult<ScenarioRunResponse> {
-    let scenario_key = request.scenario_key.trim().to_ascii_lowercase();
-    if !scenario_catalog()
-        .iter()
-        .any(|item| item.scenario_key == scenario_key)
-    {
-        return Err(AppError::BadRequest(format!(
-            "unsupported scenario {}",
-            request.scenario_key
-        )));
-    }
+    let scenario_key = canonical_scenario_key(&request.scenario_key)
+        .ok_or_else(|| AppError::BadRequest(format!("unsupported scenario {}", request.scenario_key)))?;
 
     let config = request.config.unwrap_or_default();
     let event_type = config
@@ -1674,66 +1743,93 @@ fn scenario_endpoint_specs(
             base_delay_ms: 20,
         }
     };
+    let simple_repeated_specs =
+        |base_key: &str, description: &str, behavior: serde_json::Value, attempts: i64| -> AppResult<Vec<ScenarioEndpointSpec>> {
+            let endpoint_count = validate_endpoint_count(config.endpoint_count, 1)?;
+            Ok((1..=endpoint_count)
+                .map(|index| {
+                    let endpoint_key = if endpoint_count == 1 {
+                        base_key.to_string()
+                    } else {
+                        format!("{}-{}", base_key, index)
+                    };
+                    spec(&endpoint_key, description, behavior.clone(), attempts)
+                })
+                .collect())
+        };
 
     let specs = match scenario_key {
-        "success" => vec![spec(
+        "successful_delivery" => simple_repeated_specs(
             "success",
             "scenario:success",
             behavior_for(json!({ "type": "always_succeed" })),
             max_attempts,
-        )],
-        "always_500" => vec![spec(
+        )?,
+        "persistent_server_errors" => simple_repeated_specs(
             "server-error",
             "scenario:always_500",
             behavior_for(json!({ "type": "always_fail", "status": 500 })),
             config.max_attempts.unwrap_or(2).clamp(1, 20),
-        )],
-        "timeout" => vec![spec(
+        )?,
+        "delivery_timeout" => simple_repeated_specs(
             "timeout",
             "scenario:timeout",
             behavior_for(json!({ "type": "always_timeout", "delay_ms": 30_000 })),
             config.max_attempts.unwrap_or(2).clamp(1, 20),
-        )],
-        "permanent_400" => vec![spec(
+        )?,
+        "client_error_dead_letter" => simple_repeated_specs(
             "bad-request",
             "scenario:permanent_400",
             behavior_for(json!({ "type": "always_fail", "status": 400 })),
             max_attempts,
-        )],
-        "rate_limit_429" => vec![spec(
+        )?,
+        "rate_limited_then_success" => simple_repeated_specs(
             "rate-limit",
             "scenario:rate_limit_429",
             behavior_for(json!({ "type": "sequence", "statuses": [429, 200] })),
             max_attempts,
-        )],
-        "fail_then_succeed" => vec![spec(
+        )?,
+        "retry_then_success" => simple_repeated_specs(
             "retry-success",
             "scenario:fail_then_succeed",
-            behavior_for(
-                json!({ "type": "fail_first_n_then_succeed", "failures": 1, "status": 500 }),
-            ),
+            behavior_for(json!({ "type": "fail_first_n_then_succeed", "failures": 1, "status": 500 })),
             max_attempts,
-        )],
-        "fanout_mixed" => vec![
-            spec(
-                "accounting",
-                "scenario:fanout_mixed:accounting",
-                json!({ "type": "always_succeed" }),
-                max_attempts,
-            ),
-            spec(
-                "crm",
-                "scenario:fanout_mixed:crm",
-                json!({ "type": "always_fail", "status": 500 }),
-                config.max_attempts.unwrap_or(5).clamp(1, 20),
-            ),
-            spec(
-                "analytics",
-                "scenario:fanout_mixed:analytics",
-                json!({ "type": "always_fail", "status": 400 }),
-                max_attempts,
-            ),
-        ],
+        )?,
+        "mixed_endpoint_outcomes" => {
+            let endpoint_count = validate_endpoint_count(config.endpoint_count, 3)?;
+            let mixed_attempts = config.max_attempts.unwrap_or(5).clamp(1, 20);
+            let patterns = [
+                (
+                    "accounting",
+                    "scenario:fanout_mixed:accounting",
+                    json!({ "type": "always_succeed" }),
+                    max_attempts,
+                ),
+                (
+                    "crm",
+                    "scenario:fanout_mixed:crm",
+                    json!({ "type": "always_fail", "status": 500 }),
+                    mixed_attempts,
+                ),
+                (
+                    "analytics",
+                    "scenario:fanout_mixed:analytics",
+                    json!({ "type": "always_fail", "status": 400 }),
+                    max_attempts,
+                ),
+            ];
+            (0..endpoint_count)
+                .map(|index| {
+                    let pattern = &patterns[index as usize % patterns.len()];
+                    let endpoint_key = if endpoint_count <= patterns.len() as i64 {
+                        pattern.0.to_string()
+                    } else {
+                        format!("{}-{}", pattern.0, index + 1)
+                    };
+                    spec(&endpoint_key, pattern.1, pattern.2.clone(), pattern.3)
+                })
+                .collect()
+        }
         _ => {
             return Err(AppError::BadRequest(format!(
                 "unsupported scenario {}",
@@ -1746,15 +1842,35 @@ fn scenario_endpoint_specs(
 }
 
 fn receiver_behavior_json(value: &str) -> Option<serde_json::Value> {
-    match value {
-        "success" => Some(json!({ "type": "always_succeed" })),
-        "always_500" => Some(json!({ "type": "always_fail", "status": 500 })),
-        "timeout" => Some(json!({ "type": "always_timeout", "delay_ms": 30_000 })),
-        "permanent_400" => Some(json!({ "type": "always_fail", "status": 400 })),
-        "rate_limit_429" => Some(json!({ "type": "sequence", "statuses": [429, 200] })),
-        "fail_then_succeed" => {
+    match canonical_receiver_behavior(value)? {
+        "deliver_successfully" => Some(json!({ "type": "always_succeed" })),
+        "return_server_error" => Some(json!({ "type": "always_fail", "status": 500 })),
+        "simulate_timeout" => Some(json!({ "type": "always_timeout", "delay_ms": 30_000 })),
+        "return_client_error" => Some(json!({ "type": "always_fail", "status": 400 })),
+        "rate_limit_then_succeed" => Some(json!({ "type": "sequence", "statuses": [429, 200] })),
+        "fail_once_then_succeed" => {
             Some(json!({ "type": "fail_first_n_then_succeed", "failures": 1, "status": 500 }))
         }
+        _ => None,
+    }
+}
+
+fn canonical_scenario_key(value: &str) -> Option<String> {
+    let normalized = value.trim().to_ascii_lowercase();
+    scenario_catalog()
+        .into_iter()
+        .find(|item| item.scenario_key == normalized || item.aliases.iter().any(|alias| alias == &normalized))
+        .map(|item| item.scenario_key)
+}
+
+fn canonical_receiver_behavior(value: &str) -> Option<&'static str> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "deliver_successfully" | "success" => Some("deliver_successfully"),
+        "return_server_error" | "always_500" => Some("return_server_error"),
+        "simulate_timeout" | "timeout" => Some("simulate_timeout"),
+        "return_client_error" | "permanent_400" => Some("return_client_error"),
+        "rate_limit_then_succeed" | "rate_limit_429" => Some("rate_limit_then_succeed"),
+        "fail_once_then_succeed" | "fail_then_succeed" => Some("fail_once_then_succeed"),
         _ => None,
     }
 }
@@ -3109,15 +3225,102 @@ mod tests {
         }
     }
 
-    #[test]
-    fn endpoint_url_allows_public_https_targets_without_demo_allowance() {
-        assert!(
-            validate_endpoint_url_with_local_policy("https://example.com/webhook", false).is_ok()
-        );
-    }
+#[test]
+fn endpoint_url_allows_public_https_targets_without_demo_allowance() {
+    assert!(
+        validate_endpoint_url_with_local_policy("https://example.com/webhook", false).is_ok()
+    );
+}
 
-    #[tokio::test]
-    async fn list_delivery_trace_includes_event_rows_and_only_this_delivery_rows_when_test_db_is_set()
+#[test]
+fn scenario_aliases_resolve_to_canonical_keys() {
+    assert_eq!(
+        canonical_scenario_key("success").as_deref(),
+        Some("successful_delivery")
+    );
+    assert_eq!(
+        canonical_scenario_key("mixed_endpoint_outcomes").as_deref(),
+        Some("mixed_endpoint_outcomes")
+    );
+}
+
+#[test]
+fn receiver_behavior_aliases_resolve_to_canonical_keys() {
+    assert_eq!(
+        canonical_receiver_behavior("always_500"),
+        Some("return_server_error")
+    );
+    assert_eq!(
+        canonical_receiver_behavior("deliver_successfully"),
+        Some("deliver_successfully")
+    );
+}
+
+#[test]
+fn scenario_endpoint_specs_repeat_simple_scenarios_by_endpoint_count() {
+    let config = ScenarioRunConfig {
+        endpoint_count: Some(4),
+        ..ScenarioRunConfig::default()
+    };
+
+    let specs = scenario_endpoint_specs(
+        "successful_delivery",
+        &config,
+        "payment_succeeded",
+    )
+    .expect("simple scenario specs");
+
+    assert_eq!(specs.len(), 4);
+    assert_eq!(specs[0].endpoint_key, "success-1");
+    assert_eq!(specs[3].endpoint_key, "success-4");
+}
+
+#[test]
+fn scenario_endpoint_specs_preserve_mixed_default_shape() {
+    let config = ScenarioRunConfig::default();
+
+    let specs = scenario_endpoint_specs(
+        "mixed_endpoint_outcomes",
+        &config,
+        "payment_succeeded",
+    )
+    .expect("mixed scenario specs");
+
+    let keys = specs
+        .iter()
+        .map(|spec| spec.endpoint_key.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(keys, vec!["accounting", "crm", "analytics"]);
+}
+
+#[test]
+fn scenario_endpoint_specs_expand_mixed_scenarios_when_requested() {
+    let config = ScenarioRunConfig {
+        endpoint_count: Some(5),
+        ..ScenarioRunConfig::default()
+    };
+
+    let specs = scenario_endpoint_specs(
+        "mixed_endpoint_outcomes",
+        &config,
+        "payment_succeeded",
+    )
+    .expect("expanded mixed scenario specs");
+
+    let keys = specs
+        .iter()
+        .map(|spec| spec.endpoint_key.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        keys,
+        vec!["accounting-1", "crm-2", "analytics-3", "accounting-4", "crm-5"]
+    );
+}
+
+#[tokio::test]
+async fn list_delivery_trace_includes_event_rows_and_only_this_delivery_rows_when_test_db_is_set()
     -> Result<(), Box<dyn std::error::Error>> {
         let database_url = match std::env::var("TEST_DATABASE_URL") {
             Ok(value) => value,

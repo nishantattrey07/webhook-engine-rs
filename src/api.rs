@@ -37,6 +37,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/dashboard/summary", get(get_dashboard_summary))
         .route("/api/endpoints/stats", get(list_endpoint_stats))
         .route("/api/event-types", get(list_event_types))
+        .route("/api/receiver-behaviors", get(list_receiver_behaviors))
         .route("/api/events", get(list_events))
         .route("/api/events/:event_id", get(get_event))
         .route("/api/events/:event_id/fanout", get(get_event_fanout))
@@ -155,6 +156,10 @@ async fn list_endpoint_stats(
 
 async fn list_event_types() -> Json<Vec<&'static str>> {
     Json(services::allowed_event_types())
+}
+
+async fn list_receiver_behaviors() -> Json<Vec<crate::models::ReceiverBehaviorOption>> {
+    Json(services::receiver_behavior_catalog())
 }
 
 async fn list_scenarios() -> Json<Vec<crate::models::ScenarioCatalogItem>> {
