@@ -1,9 +1,20 @@
+use chrono::{DateTime, Utc};
 use serde_json::json;
+use sqlx::{PgPool, Postgres, Row, Transaction};
 
-use super::{payment_status_input_for_event_type, validate_endpoint_count, validate_max_attempts};
+use super::{
+    endpoints::create_endpoint,
+    payments::create_payment_in_tx,
+    validation::{normalize_optional_text, validate_endpoint_count, validate_max_attempts},
+};
 use crate::{
     error::{AppError, AppResult},
-    models::{PaymentStatusInput, ReceiverBehaviorOption, ScenarioCatalogItem, ScenarioRunConfig},
+    models::{
+        CreateEndpointRequest, CreatePaymentRequest, PaymentStatusInput, ReceiverBehaviorOption,
+        ScenarioArtifacts, ScenarioCatalogItem, ScenarioDetailResponse, ScenarioPlanDetail,
+        ScenarioPlannedEndpoint, ScenarioPlannedExpectations, ScenarioRunConfig,
+        ScenarioRunRequest, ScenarioRunResponse, ScenarioSummary,
+    },
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -257,6 +268,18 @@ pub fn resolve_receiver_behavior(value: &str) -> Option<&'static str> {
     canonical_receiver_behavior(value)
 }
 
+fn payment_status_input_for_event_type(event_type: &str) -> AppResult<PaymentStatusInput> {
+    match event_type {
+        "payment_succeeded" => Ok(PaymentStatusInput::Succeeded),
+        "payment_failed" => Ok(PaymentStatusInput::Failed),
+        "payment_refund" => Ok(PaymentStatusInput::Refunded),
+        _ => Err(AppError::BadRequest(format!(
+            "unsupported event type {}",
+            event_type
+        ))),
+    }
+}
+
 pub fn build_scenario_run_plan(
     scenario_key: &str,
     merchant_id: i64,
@@ -271,7 +294,7 @@ pub fn build_scenario_run_plan(
         .clone()
         .unwrap_or_else(|| "payment_succeeded".to_string());
     let payment_status = payment_status_input_for_event_type(&event_type)?;
-    let payment_count = config.payment_count.unwrap_or(1).clamp(1, 100);
+    let payment_count = validate_payment_count(config.payment_count)?;
     let receiver_behavior = config
         .receiver_behavior
         .as_deref()
@@ -299,6 +322,18 @@ pub fn build_scenario_run_plan(
     })
 }
 
+fn validate_payment_count(payment_count: Option<i64>) -> AppResult<i64> {
+    let payment_count = payment_count.unwrap_or(1);
+
+    if !(1..=100).contains(&payment_count) {
+        return Err(AppError::BadRequest(
+            "payment_count must be between 1 and 100".to_string(),
+        ));
+    }
+
+    Ok(payment_count)
+}
+
 pub fn plan_scenario_endpoints(
     scenario_key: &str,
     config: &ScenarioRunConfig,
@@ -306,6 +341,7 @@ pub fn plan_scenario_endpoints(
 ) -> AppResult<Vec<PlannedScenarioEndpoint>> {
     let mut plan_config = config.clone();
     plan_config.event_type = Some(event_type.to_string());
+    plan_config.payment_count = None;
     build_scenario_run_plan(scenario_key, 0, &plan_config).map(|plan| plan.endpoints)
 }
 
@@ -345,6 +381,445 @@ fn validate_scenario_request(
     }
 
     Ok(())
+}
+
+pub async fn run_scenario(
+    pool: &PgPool,
+    receiver_base_url: &str,
+    request: ScenarioRunRequest,
+) -> AppResult<ScenarioRunResponse> {
+    let config = request.config.unwrap_or_default();
+    let merchant_id = config
+        .merchant_id
+        .unwrap_or_else(|| 700_000_000 + (Utc::now().timestamp_micros() % 100_000_000));
+    let plan = build_scenario_run_plan(&request.scenario_key, merchant_id, &config)?;
+    let requested_by = normalize_optional_text(request.requested_by, "requested_by", 200)?;
+    let config_json = json!({
+        "requested": serde_json::to_value(&config).unwrap_or_else(|_| json!({})),
+        "effective": {
+            "scenario_key": plan.scenario_key,
+            "scenario_kind": plan.scenario_kind,
+            "merchant_id": plan.merchant_id,
+            "payment_count": plan.payment_count,
+            "event_type": plan.event_type,
+            "endpoint_count": plan.expected_endpoint_count,
+            "receiver_behavior": plan.receiver_behavior,
+            "expected_payment_count": plan.expected_payment_count,
+            "expected_event_count": plan.expected_event_count,
+            "expected_endpoint_count": plan.expected_endpoint_count,
+            "expected_delivery_count": plan.expected_delivery_count
+        }
+    });
+    let initial_step_log = scenario_plan_step_log(&plan);
+
+    let mut tx = pool.begin().await?;
+    let row = sqlx::query(
+        "INSERT INTO scenarios (
+            scenario_key,
+            status,
+            requested_by,
+            merchant_id,
+            config_json,
+            receiver_config_json,
+            step_log_json,
+            started_at
+         )
+         VALUES ($1, 'running', $2, $3, $4, '[]'::jsonb, $5, NOW())
+         RETURNING scenario_id, started_at",
+    )
+    .bind(&plan.scenario_key)
+    .bind(requested_by.as_deref())
+    .bind(plan.merchant_id)
+    .bind(config_json)
+    .bind(json!(initial_step_log))
+    .fetch_one(&mut *tx)
+    .await?;
+
+    let scenario_id: i64 = row.get("scenario_id");
+    let started_at: DateTime<Utc> = row.get("started_at");
+    persist_scenario_plan(&mut tx, scenario_id, &plan).await?;
+    tx.commit().await?;
+
+    if let Err(error) = setup_scenario(pool, receiver_base_url, scenario_id, &plan).await {
+        let message = error.to_string();
+        sqlx::query(
+            "UPDATE scenarios
+             SET status = 'failed',
+                 error_message = $2,
+                 completed_at = NOW()
+             WHERE scenario_id = $1",
+        )
+        .bind(scenario_id)
+        .bind(&message)
+        .execute(pool)
+        .await?;
+        return Err(error);
+    }
+
+    Ok(ScenarioRunResponse {
+        scenario_id,
+        scenario_key: plan.scenario_key,
+        status: "running".to_string(),
+        started_at,
+        merchant_id: plan.merchant_id,
+    })
+}
+
+async fn setup_scenario(
+    pool: &PgPool,
+    receiver_base_url: &str,
+    scenario_id: i64,
+    plan: &PlannedScenarioRun,
+) -> AppResult<()> {
+    let mut receiver_configs = Vec::with_capacity(plan.endpoints.len());
+    let mut step_log = scenario_plan_step_log(plan);
+    persist_scenario_runtime_state(pool, scenario_id, &receiver_configs, &step_log).await?;
+
+    for endpoint in &plan.endpoints {
+        configure_mock_receiver_endpoint(receiver_base_url, plan.merchant_id, endpoint).await?;
+        receiver_configs.push(json!({
+            "merchant_id": plan.merchant_id,
+            "ordinal": endpoint.ordinal,
+            "endpoint_role": endpoint.endpoint_role,
+            "endpoint_key": endpoint.endpoint_key,
+            "behavior_key": endpoint.behavior_key,
+            "behavior": endpoint.behavior,
+            "base_delay_ms": endpoint.base_delay_ms,
+            "max_attempts": endpoint.max_attempts,
+            "event_types": endpoint.event_types
+        }));
+
+        let response = create_endpoint(
+            pool,
+            CreateEndpointRequest {
+                merchant_id: plan.merchant_id,
+                url: format!(
+                    "{}/webhook/{}/{}",
+                    receiver_base_url.trim_end_matches('/'),
+                    plan.merchant_id,
+                    endpoint.endpoint_key
+                ),
+                secret: endpoint.secret.clone(),
+                description: Some(endpoint.description.clone()),
+                max_attempts: Some(endpoint.max_attempts),
+                subscribed_events: endpoint.event_types.clone(),
+            },
+        )
+        .await?;
+        sqlx::query(
+            "UPDATE scenario_run_endpoints
+             SET created_endpoint_id = $3
+             WHERE scenario_id = $1 AND ordinal = $2",
+        )
+        .bind(scenario_id)
+        .bind(endpoint.ordinal)
+        .bind(response.endpoint_id)
+        .execute(pool)
+        .await?;
+        step_log.push(json!({
+            "step": "endpoint_created",
+            "endpoint_id": response.endpoint_id,
+            "endpoint_key": endpoint.endpoint_key,
+            "ordinal": endpoint.ordinal
+        }));
+        persist_scenario_runtime_state(pool, scenario_id, &receiver_configs, &step_log).await?;
+    }
+
+    let mut tx = pool.begin().await?;
+    for index in 0..plan.payment_count {
+        let created = create_payment_in_tx(
+            &mut tx,
+            CreatePaymentRequest {
+                merchant_id: plan.merchant_id,
+                order_id: Utc::now().timestamp_micros() + index,
+                amount: 1_000 + index,
+                status: plan.payment_status.clone(),
+                mode_of_payment: "scenario_lab".to_string(),
+            },
+            Some(scenario_id),
+        )
+        .await?;
+        step_log.push(json!({
+            "step": "payment_created",
+            "payment_id": created.payment_id,
+            "event_id": created.event_id,
+            "delivery_count": created.delivery_count
+        }));
+    }
+    tx.commit().await?;
+    persist_scenario_runtime_state(pool, scenario_id, &receiver_configs, &step_log).await?;
+
+    Ok(())
+}
+
+fn scenario_plan_step_log(plan: &PlannedScenarioRun) -> Vec<serde_json::Value> {
+    vec![json!({
+        "step": "plan_persisted",
+        "scenario_key": plan.scenario_key,
+        "scenario_kind": plan.scenario_kind,
+        "event_type": plan.event_type,
+        "payment_count": plan.payment_count,
+        "endpoint_count": plan.expected_endpoint_count,
+        "expected_delivery_count": plan.expected_delivery_count
+    })]
+}
+
+async fn persist_scenario_plan(
+    tx: &mut Transaction<'_, Postgres>,
+    scenario_id: i64,
+    plan: &PlannedScenarioRun,
+) -> AppResult<()> {
+    sqlx::query(
+        "INSERT INTO scenario_run_expectations (
+            scenario_id,
+            expected_payment_count,
+            expected_event_count,
+            expected_endpoint_count,
+            expected_delivery_count
+         )
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(scenario_id)
+    .bind(plan.expected_payment_count)
+    .bind(plan.expected_event_count)
+    .bind(plan.expected_endpoint_count)
+    .bind(plan.expected_delivery_count)
+    .execute(&mut **tx)
+    .await?;
+
+    for endpoint in &plan.endpoints {
+        sqlx::query(
+            "INSERT INTO scenario_run_endpoints (
+                scenario_id,
+                ordinal,
+                endpoint_role,
+                endpoint_key,
+                behavior_key,
+                behavior_json,
+                base_delay_ms,
+                max_attempts
+             )
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+        )
+        .bind(scenario_id)
+        .bind(endpoint.ordinal)
+        .bind(endpoint.endpoint_role.as_deref())
+        .bind(&endpoint.endpoint_key)
+        .bind(&endpoint.behavior_key)
+        .bind(&endpoint.behavior)
+        .bind(endpoint.base_delay_ms)
+        .bind(endpoint.max_attempts)
+        .execute(&mut **tx)
+        .await?;
+    }
+
+    Ok(())
+}
+
+async fn persist_scenario_runtime_state(
+    pool: &PgPool,
+    scenario_id: i64,
+    receiver_configs: &[serde_json::Value],
+    step_log: &[serde_json::Value],
+) -> AppResult<()> {
+    sqlx::query(
+        "UPDATE scenarios
+         SET receiver_config_json = $2,
+             step_log_json = $3
+         WHERE scenario_id = $1",
+    )
+    .bind(scenario_id)
+    .bind(json!(receiver_configs))
+    .bind(json!(step_log))
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+async fn configure_mock_receiver_endpoint(
+    receiver_base_url: &str,
+    merchant_id: i64,
+    endpoint: &PlannedScenarioEndpoint,
+) -> AppResult<()> {
+    let url = format!(
+        "{}/admin/endpoints",
+        receiver_base_url.trim_end_matches('/')
+    );
+    let response = reqwest::Client::new()
+        .post(url)
+        .json(&json!({
+            "merchant_id": merchant_id,
+            "endpoint_key": endpoint.endpoint_key,
+            "behavior": endpoint.behavior,
+            "base_delay_ms": endpoint.base_delay_ms,
+            "secret": endpoint.secret,
+            "verify_signature": true,
+            "enabled": true
+        }))
+        .send()
+        .await
+        .map_err(|error| AppError::BadRequest(format!("mock receiver is unreachable: {error}")))?;
+
+    if !response.status().is_success() {
+        return Err(AppError::BadRequest(format!(
+            "mock receiver endpoint configuration failed with status {}",
+            response.status()
+        )));
+    }
+
+    Ok(())
+}
+
+pub async fn get_scenario(pool: &PgPool, scenario_id: i64) -> AppResult<ScenarioDetailResponse> {
+    let scenario = sqlx::query(
+        "SELECT
+            scenario_id,
+            scenario_key,
+            status,
+            requested_by,
+            merchant_id,
+            receiver_config_json,
+            step_log_json,
+            error_message,
+            started_at,
+            completed_at
+         FROM scenarios
+         WHERE scenario_id = $1",
+    )
+    .bind(scenario_id)
+    .fetch_optional(pool)
+    .await?
+    .ok_or_else(|| AppError::NotFound(format!("scenario {} not found", scenario_id)))?;
+
+    let summary_row = sqlx::query(
+        "SELECT
+            (SELECT COUNT(*)::BIGINT FROM payments WHERE scenario_id = $1) AS payments_created,
+            (SELECT COUNT(*)::BIGINT FROM domain_events WHERE scenario_id = $1) AS events_created,
+            COUNT(d.delivery_id)::BIGINT AS deliveries_created,
+            COUNT(d.delivery_id) FILTER (WHERE d.status = 'delivered')::BIGINT AS delivered_count,
+            COUNT(d.delivery_id) FILTER (WHERE d.status = 'retrying')::BIGINT AS retrying_count,
+            COUNT(d.delivery_id) FILTER (WHERE d.status = 'dead_lettered')::BIGINT AS dead_lettered_count,
+            COUNT(d.delivery_id) FILTER (WHERE d.status IN ('pending', 'queued', 'processing', 'retrying'))::BIGINT AS active_count
+         FROM webhook_deliveries d
+         WHERE d.scenario_id = $1",
+    )
+    .bind(scenario_id)
+    .fetch_one(pool)
+    .await?;
+
+    let artifacts_row = sqlx::query(
+        "SELECT
+            COALESCE((SELECT array_agg(payment_id ORDER BY payment_id) FROM payments WHERE scenario_id = $1), ARRAY[]::BIGINT[]) AS payment_ids,
+            COALESCE((SELECT array_agg(event_id ORDER BY event_id) FROM domain_events WHERE scenario_id = $1), ARRAY[]::BIGINT[]) AS event_ids,
+            COALESCE((SELECT array_agg(delivery_id ORDER BY delivery_id) FROM webhook_deliveries WHERE scenario_id = $1), ARRAY[]::BIGINT[]) AS delivery_ids,
+            COALESCE((SELECT array_agg(DISTINCT endpoint_id ORDER BY endpoint_id) FROM webhook_deliveries WHERE scenario_id = $1), ARRAY[]::BIGINT[]) AS endpoint_ids",
+    )
+    .bind(scenario_id)
+    .fetch_one(pool)
+    .await?;
+    let expectations_row = sqlx::query(
+        "SELECT
+            expected_payment_count,
+            expected_event_count,
+            expected_endpoint_count,
+            expected_delivery_count
+         FROM scenario_run_expectations
+         WHERE scenario_id = $1",
+    )
+    .bind(scenario_id)
+    .fetch_optional(pool)
+    .await?;
+    let planned_endpoint_rows = sqlx::query(
+        "SELECT
+            ordinal,
+            endpoint_role,
+            endpoint_key,
+            behavior_key,
+            behavior_json,
+            base_delay_ms,
+            max_attempts,
+            created_endpoint_id
+         FROM scenario_run_endpoints
+         WHERE scenario_id = $1
+         ORDER BY ordinal",
+    )
+    .bind(scenario_id)
+    .fetch_all(pool)
+    .await?;
+
+    let db_status: String = scenario.get("status");
+    let active_count: i64 = summary_row.get("active_count");
+    let deliveries_created: i64 = summary_row.get("deliveries_created");
+    let computed_status = if db_status == "failed" {
+        "failed"
+    } else if deliveries_created > 0 && active_count == 0 {
+        "completed"
+    } else {
+        "running"
+    };
+
+    if computed_status == "completed" && db_status != "completed" {
+        sqlx::query(
+            "UPDATE scenarios
+             SET status = 'completed',
+                 completed_at = COALESCE(completed_at, NOW())
+             WHERE scenario_id = $1",
+        )
+        .bind(scenario_id)
+        .execute(pool)
+        .await?;
+    }
+
+    let planned = expectations_row.map(|expectations| ScenarioPlanDetail {
+        expectations: ScenarioPlannedExpectations {
+            payment_count: expectations.get("expected_payment_count"),
+            event_count: expectations.get("expected_event_count"),
+            endpoint_count: expectations.get("expected_endpoint_count"),
+            delivery_count: expectations.get("expected_delivery_count"),
+        },
+        endpoints: planned_endpoint_rows
+            .into_iter()
+            .map(|row| ScenarioPlannedEndpoint {
+                ordinal: row.get("ordinal"),
+                endpoint_role: row.get("endpoint_role"),
+                endpoint_key: row.get("endpoint_key"),
+                behavior_key: row.get("behavior_key"),
+                behavior: row.get("behavior_json"),
+                base_delay_ms: row.get("base_delay_ms"),
+                max_attempts: row.get("max_attempts"),
+                created_endpoint_id: row.get("created_endpoint_id"),
+            })
+            .collect(),
+    });
+
+    Ok(ScenarioDetailResponse {
+        scenario_id,
+        scenario_key: scenario.get("scenario_key"),
+        status: computed_status.to_string(),
+        started_at: scenario.get("started_at"),
+        completed_at: scenario.get("completed_at"),
+        merchant_id: scenario.get("merchant_id"),
+        requested_by: scenario.get("requested_by"),
+        summary: ScenarioSummary {
+            payments_created: summary_row.get("payments_created"),
+            events_created: summary_row.get("events_created"),
+            deliveries_created,
+            delivered_count: summary_row.get("delivered_count"),
+            retrying_count: summary_row.get("retrying_count"),
+            dead_lettered_count: summary_row.get("dead_lettered_count"),
+        },
+        artifacts: ScenarioArtifacts {
+            payment_ids: artifacts_row.get("payment_ids"),
+            event_ids: artifacts_row.get("event_ids"),
+            delivery_ids: artifacts_row.get("delivery_ids"),
+            endpoint_ids: artifacts_row.get("endpoint_ids"),
+        },
+        planned,
+        receiver_config: scenario.get("receiver_config_json"),
+        step_log: scenario.get("step_log_json"),
+        error_message: scenario.get("error_message"),
+    })
 }
 
 fn scenario_endpoint_specs(

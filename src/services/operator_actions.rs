@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use serde_json::json;
 use sqlx::{PgPool, Postgres, Row, Transaction};
 
-use super::{append_delivery_trace_in_tx, normalize_optional_text};
+use super::{trace::append_delivery_trace_in_tx, validation::normalize_optional_text};
 use crate::{
     error::{AppError, AppResult},
     models::{

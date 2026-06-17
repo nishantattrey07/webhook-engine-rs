@@ -1,4 +1,7 @@
-use std::time::Duration;
+use std::{
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    time::Duration,
+};
 
 use chrono::{DateTime, Utc};
 use hmac::{Hmac, Mac};
@@ -7,10 +10,11 @@ use redis::{
     aio::ConnectionManager,
     streams::{StreamAutoClaimOptions, StreamAutoClaimReply, StreamId, StreamReadReply},
 };
-use reqwest::Client;
+use reqwest::{Client, Url};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, Row, Transaction};
+use tokio::net::lookup_host;
 
 type HmacSha256 = Hmac<Sha256>;
 type DeliveryTaskResult = Result<(i64, Result<(), sqlx::Error>), tokio::task::JoinError>;
@@ -1543,6 +1547,15 @@ async fn send_webhook(
     attempt_count: i64,
     payload: &Value,
 ) -> DeliveryResult {
+    if let Err(error) = validate_delivery_target(&delivery.endpoint_url).await {
+        return DeliveryResult {
+            outcome: DeliveryOutcome::PermanentFailure,
+            http_status: None,
+            response_body_sample: None,
+            error_message: Some(error),
+        };
+    }
+
     let body = match serde_json::to_vec(payload) {
         Ok(body) => body,
         Err(error) => {
@@ -1636,6 +1649,97 @@ async fn send_webhook(
             error_message: Some(error.to_string()),
         },
     }
+}
+
+async fn validate_delivery_target(endpoint_url: &str) -> Result<(), String> {
+    let parsed = Url::parse(endpoint_url.trim())
+        .map_err(|_| "endpoint URL must be a valid URL".to_string())?;
+
+    match parsed.scheme() {
+        "http" | "https" => {}
+        _ => return Err("endpoint URL must use http or https".to_string()),
+    }
+
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| "endpoint URL must include a host".to_string())?;
+
+    if allow_local_webhook_targets() {
+        return Ok(());
+    }
+
+    if is_blocked_webhook_host(host) {
+        return Err("endpoint URL resolves to a blocked local or private target".to_string());
+    }
+
+    let port = parsed
+        .port_or_known_default()
+        .ok_or_else(|| "endpoint URL must include a valid port".to_string())?;
+    let resolved = lookup_host((host, port))
+        .await
+        .map_err(|error| format!("failed to resolve endpoint host: {error}"))?
+        .collect::<Vec<_>>();
+
+    if resolved.is_empty() {
+        return Err("endpoint host did not resolve to any addresses".to_string());
+    }
+
+    if resolved.iter().any(|address| is_blocked_ip(address.ip())) {
+        return Err("endpoint URL resolves to a blocked local or private target".to_string());
+    }
+
+    Ok(())
+}
+
+fn allow_local_webhook_targets() -> bool {
+    std::env::var("ALLOW_LOCAL_WEBHOOK_TARGETS")
+        .map(|value| value == "1")
+        .unwrap_or(false)
+}
+
+fn is_blocked_webhook_host(host: &str) -> bool {
+    let host = host.trim().trim_matches(['[', ']']).to_ascii_lowercase();
+
+    if matches!(
+        host.as_str(),
+        "localhost" | "metadata" | "metadata.google.internal"
+    ) {
+        return true;
+    }
+
+    host.parse::<IpAddr>().map(is_blocked_ip).unwrap_or(false)
+}
+
+fn is_blocked_ip(addr: IpAddr) -> bool {
+    match addr {
+        IpAddr::V4(addr) => is_blocked_ipv4(addr),
+        IpAddr::V6(addr) => is_blocked_ipv6(addr),
+    }
+}
+
+fn is_blocked_ipv4(addr: Ipv4Addr) -> bool {
+    addr.is_loopback()
+        || addr.is_private()
+        || addr.is_link_local()
+        || addr.is_multicast()
+        || addr.is_unspecified()
+        || addr == Ipv4Addr::new(169, 254, 169, 254)
+}
+
+fn is_blocked_ipv6(addr: Ipv6Addr) -> bool {
+    addr.is_loopback()
+        || addr.is_multicast()
+        || addr.is_unspecified()
+        || is_ipv6_unique_local(addr)
+        || is_ipv6_unicast_link_local(addr)
+}
+
+fn is_ipv6_unique_local(addr: Ipv6Addr) -> bool {
+    (addr.segments()[0] & 0xfe00) == 0xfc00
+}
+
+fn is_ipv6_unicast_link_local(addr: Ipv6Addr) -> bool {
+    (addr.segments()[0] & 0xffc0) == 0xfe80
 }
 
 fn sha256_hex(body: &[u8]) -> String {
@@ -2138,6 +2242,32 @@ mod tests {
     #[test]
     fn http_client_builder_uses_redirect_policy_none() {
         assert!(build_http_client(Duration::from_millis(100)).is_some());
+    }
+
+    #[test]
+    fn delivery_target_guard_blocks_literal_local_and_private_hosts() {
+        for host in [
+            "localhost",
+            "127.0.0.1",
+            "10.0.0.5",
+            "172.16.0.1",
+            "192.168.1.2",
+            "169.254.169.254",
+            "::1",
+            "fc00::1",
+            "fe80::1",
+            "metadata.google.internal",
+        ] {
+            assert!(is_blocked_webhook_host(host), "{host} should be blocked");
+        }
+    }
+
+    #[test]
+    fn delivery_target_guard_allows_public_literal_hosts() {
+        assert!(!is_blocked_webhook_host("93.184.216.34"));
+        assert!(!is_blocked_webhook_host(
+            "2606:2800:220:1:248:1893:25c8:1946"
+        ));
     }
 
     #[test]
