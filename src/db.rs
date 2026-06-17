@@ -21,6 +21,7 @@ pub async fn run_schema_bootstrap(pool: &PgPool) -> AppResult<()> {
         include_str!("../migrations/002_delivery_search_indexes.sql"),
         include_str!("../migrations/003_scenario_run_planning.sql"),
         include_str!("../migrations/004_manual_retry_active_child_guard.sql"),
+        include_str!("../migrations/005_scenario_history_visibility.sql"),
     ];
 
     for schema in schemas {

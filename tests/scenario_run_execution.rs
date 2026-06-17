@@ -3,8 +3,8 @@ mod support;
 use serde_json::Value;
 use sqlx::Row;
 use webhook_engine::{
-    models::{ScenarioRunConfig, ScenarioRunRequest},
-    services::{get_scenario, run_scenario},
+    models::{ScenarioHistoryQuery, ScenarioRunConfig, ScenarioRunRequest},
+    services::{get_scenario, list_scenario_history, run_scenario},
 };
 
 #[tokio::test]
@@ -27,6 +27,7 @@ async fn run_scenario_persists_plan_and_executes_from_it_when_test_db_is_set()
             ScenarioRunRequest {
                 scenario_key: "custom_receiver_behavior".to_string(),
                 requested_by: Some("Operator".to_string()),
+                include_in_history: None,
                 config: Some(ScenarioRunConfig {
                     merchant_id: Some(793_189_338),
                     payment_count: Some(2),
@@ -93,6 +94,7 @@ async fn run_scenario_persists_plan_and_executes_from_it_when_test_db_is_set()
         let detail = get_scenario(&pool, response.scenario_id).await?;
         assert_eq!(detail.scenario_key, "custom_receiver_behavior");
         assert_eq!(detail.requested_by.as_deref(), Some("Operator"));
+        assert!(detail.include_in_history);
         assert_eq!(detail.summary.payments_created, 2);
         assert_eq!(detail.summary.events_created, 2);
         assert_eq!(detail.summary.deliveries_created, 6);
@@ -151,6 +153,55 @@ async fn run_scenario_persists_plan_and_executes_from_it_when_test_db_is_set()
                 .all(|request| request["merchant_id"].as_i64() == Some(793_189_338))
         );
 
+        let history = list_scenario_history(
+            &pool,
+            ScenarioHistoryQuery {
+                status: None,
+                scenario_key: Some("custom_receiver_behavior".to_string()),
+                requested_by: Some("Operator".to_string()),
+                include_hidden: None,
+                cursor: None,
+                limit: Some(10),
+            },
+        )
+        .await?;
+        assert_eq!(history.items.len(), 1);
+        assert_eq!(history.items[0].scenario_id, response.scenario_id);
+        assert!(history.items[0].include_in_history);
+        assert_eq!(history.items[0].payments_created, 2);
+        assert_eq!(history.items[0].deliveries_created, 6);
+
+        sqlx::query(
+            "UPDATE webhook_deliveries
+             SET status = 'delivered',
+                 final_state_at = NOW(),
+                 updated_at = NOW()
+             WHERE scenario_id = $1",
+        )
+        .bind(response.scenario_id)
+        .execute(&pool)
+        .await?;
+
+        let completed_history = list_scenario_history(
+            &pool,
+            ScenarioHistoryQuery {
+                status: Some("completed".to_string()),
+                scenario_key: Some("custom_receiver_behavior".to_string()),
+                requested_by: Some("Operator".to_string()),
+                include_hidden: None,
+                cursor: None,
+                limit: Some(10),
+            },
+        )
+        .await?;
+        assert_eq!(completed_history.items.len(), 1);
+        assert_eq!(completed_history.items[0].scenario_id, response.scenario_id);
+        assert_eq!(completed_history.items[0].status, "completed");
+
+        let completed_detail = get_scenario(&pool, response.scenario_id).await?;
+        assert_eq!(completed_detail.status, "completed");
+        assert!(completed_detail.completed_at.is_some());
+
         Ok::<(), Box<dyn std::error::Error>>(())
     }
     .await;
@@ -179,6 +230,7 @@ async fn failed_scenario_setup_disables_partially_created_endpoints_when_test_db
             ScenarioRunRequest {
                 scenario_key: "successful_delivery".to_string(),
                 requested_by: Some("Operator".to_string()),
+                include_in_history: None,
                 config: Some(ScenarioRunConfig {
                     merchant_id: Some(793_189_339),
                     payment_count: Some(1),
@@ -241,6 +293,78 @@ async fn failed_scenario_setup_disables_partially_created_endpoints_when_test_db
 
         let receiver_requests = receiver.requests.lock().await;
         assert_eq!(receiver_requests.len(), 1);
+
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await;
+
+    receiver.shutdown().await;
+    result
+}
+
+#[tokio::test]
+async fn scenario_history_hides_seed_runs_unless_requested_when_test_db_is_set()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _guard = support::acquire_db_lock().await;
+    let Some(pool) = support::test_pool().await else {
+        return Ok(());
+    };
+
+    let receiver = support::spawn_mock_receiver().await;
+    let result = async {
+        unsafe {
+            std::env::set_var("ALLOW_LOCAL_WEBHOOK_TARGETS", "1");
+        }
+
+        let response = run_scenario(
+            &pool,
+            &receiver.base_url,
+            ScenarioRunRequest {
+                scenario_key: "successful_delivery".to_string(),
+                requested_by: Some("frontend-demo-seed".to_string()),
+                include_in_history: Some(false),
+                config: Some(ScenarioRunConfig {
+                    merchant_id: Some(793_189_340),
+                    payment_count: Some(1),
+                    endpoint_count: Some(1),
+                    ..ScenarioRunConfig::default()
+                }),
+            },
+        )
+        .await?;
+
+        let detail = get_scenario(&pool, response.scenario_id).await?;
+        assert!(!detail.include_in_history);
+
+        let visible_history = list_scenario_history(
+            &pool,
+            ScenarioHistoryQuery {
+                status: None,
+                scenario_key: None,
+                requested_by: None,
+                include_hidden: None,
+                cursor: None,
+                limit: Some(10),
+            },
+        )
+        .await?;
+        assert!(visible_history.items.is_empty());
+
+        let hidden_history = list_scenario_history(
+            &pool,
+            ScenarioHistoryQuery {
+                status: None,
+                scenario_key: None,
+                requested_by: None,
+                include_hidden: Some(true),
+                cursor: None,
+                limit: Some(10),
+            },
+        )
+        .await?;
+        assert_eq!(hidden_history.items.len(), 1);
+        assert_eq!(hidden_history.items[0].scenario_id, response.scenario_id);
+        assert!(!hidden_history.items[0].include_in_history);
 
         Ok::<(), Box<dyn std::error::Error>>(())
     }

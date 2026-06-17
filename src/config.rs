@@ -37,7 +37,19 @@ impl AppConfig {
             .unwrap_or_else(|_| "http://127.0.0.1:3000".to_string());
 
         let cors_allowed_origins = std::env::var("CORS_ALLOWED_ORIGINS")
-            .unwrap_or_else(|_| "http://localhost:3000,http://127.0.0.1:3000".to_string())
+            .unwrap_or_else(|_| {
+                [
+                    "http://localhost:3000",
+                    "http://127.0.0.1:3000",
+                    "http://localhost:3001",
+                    "http://127.0.0.1:3001",
+                    "http://localhost:5173",
+                    "http://127.0.0.1:5173",
+                    "http://localhost:5174",
+                    "http://127.0.0.1:5174",
+                ]
+                .join(",")
+            })
             .split(',')
             .map(str::trim)
             .filter(|origin| !origin.is_empty())

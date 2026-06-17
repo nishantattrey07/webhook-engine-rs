@@ -462,6 +462,7 @@ pub struct ReceiverBehaviorOption {
 pub struct ScenarioRunRequest {
     pub scenario_key: String,
     pub requested_by: Option<String>,
+    pub include_in_history: Option<bool>,
     pub config: Option<ScenarioRunConfig>,
 }
 
@@ -492,6 +493,42 @@ pub struct ScenarioSummary {
     pub delivered_count: i64,
     pub retrying_count: i64,
     pub dead_lettered_count: i64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ScenarioHistoryQuery {
+    pub status: Option<String>,
+    pub scenario_key: Option<String>,
+    pub requested_by: Option<String>,
+    pub include_hidden: Option<bool>,
+    pub cursor: Option<i64>,
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct ScenarioHistoryItem {
+    pub scenario_id: i64,
+    pub scenario_key: String,
+    pub status: String,
+    pub merchant_id: i64,
+    pub requested_by: Option<String>,
+    pub include_in_history: bool,
+    pub started_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub error_message: Option<String>,
+    pub payments_created: i64,
+    pub events_created: i64,
+    pub deliveries_created: i64,
+    pub delivered_count: i64,
+    pub retrying_count: i64,
+    pub dead_lettered_count: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PaginatedScenarioHistoryResponse {
+    pub items: Vec<ScenarioHistoryItem>,
+    pub next_cursor: Option<i64>,
+    pub limit: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -537,6 +574,7 @@ pub struct ScenarioDetailResponse {
     pub completed_at: Option<DateTime<Utc>>,
     pub merchant_id: i64,
     pub requested_by: Option<String>,
+    pub include_in_history: bool,
     pub summary: ScenarioSummary,
     pub artifacts: ScenarioArtifacts,
     pub planned: Option<ScenarioPlanDetail>,

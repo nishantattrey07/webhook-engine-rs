@@ -10,8 +10,9 @@ use super::{
 use crate::{
     error::{AppError, AppResult},
     models::{
-        CreateEndpointRequest, CreatePaymentRequest, PaymentStatusInput, ReceiverBehaviorOption,
-        ScenarioArtifacts, ScenarioCatalogItem, ScenarioDetailResponse, ScenarioPlanDetail,
+        CreateEndpointRequest, CreatePaymentRequest, PaginatedScenarioHistoryResponse,
+        PaymentStatusInput, ReceiverBehaviorOption, ScenarioArtifacts, ScenarioCatalogItem,
+        ScenarioDetailResponse, ScenarioHistoryItem, ScenarioHistoryQuery, ScenarioPlanDetail,
         ScenarioPlannedEndpoint, ScenarioPlannedExpectations, ScenarioRunConfig,
         ScenarioRunRequest, ScenarioRunResponse, ScenarioSummary,
     },
@@ -394,6 +395,7 @@ pub async fn run_scenario(
         .unwrap_or_else(|| 700_000_000 + (Utc::now().timestamp_micros() % 100_000_000));
     let plan = build_scenario_run_plan(&request.scenario_key, merchant_id, &config)?;
     let requested_by = normalize_optional_text(request.requested_by, "requested_by", 200)?;
+    let include_in_history = request.include_in_history.unwrap_or(true);
     let config_json = json!({
         "requested": serde_json::to_value(&config).unwrap_or_else(|_| json!({})),
         "effective": {
@@ -422,9 +424,10 @@ pub async fn run_scenario(
             config_json,
             receiver_config_json,
             step_log_json,
+            include_in_history,
             started_at
          )
-         VALUES ($1, 'running', $2, $3, $4, '[]'::jsonb, $5, NOW())
+         VALUES ($1, 'running', $2, $3, $4, '[]'::jsonb, $5, $6, NOW())
          RETURNING scenario_id, started_at",
     )
     .bind(&plan.scenario_key)
@@ -432,6 +435,7 @@ pub async fn run_scenario(
     .bind(plan.merchant_id)
     .bind(config_json)
     .bind(json!(initial_step_log))
+    .bind(include_in_history)
     .fetch_one(&mut *tx)
     .await?;
 
@@ -748,6 +752,7 @@ pub async fn get_scenario(pool: &PgPool, scenario_id: i64) -> AppResult<Scenario
             status,
             requested_by,
             merchant_id,
+            include_in_history,
             receiver_config_json,
             step_log_json,
             error_message,
@@ -828,16 +833,19 @@ pub async fn get_scenario(pool: &PgPool, scenario_id: i64) -> AppResult<Scenario
         "running"
     };
 
+    let mut completed_at = scenario.get("completed_at");
     if computed_status == "completed" && db_status != "completed" {
-        sqlx::query(
+        completed_at = sqlx::query(
             "UPDATE scenarios
              SET status = 'completed',
                  completed_at = COALESCE(completed_at, NOW())
-             WHERE scenario_id = $1",
+             WHERE scenario_id = $1
+             RETURNING completed_at",
         )
         .bind(scenario_id)
-        .execute(pool)
-        .await?;
+        .fetch_one(pool)
+        .await?
+        .get("completed_at");
     }
 
     let planned = expectations_row.map(|expectations| ScenarioPlanDetail {
@@ -867,9 +875,10 @@ pub async fn get_scenario(pool: &PgPool, scenario_id: i64) -> AppResult<Scenario
         scenario_key: scenario.get("scenario_key"),
         status: computed_status.to_string(),
         started_at: scenario.get("started_at"),
-        completed_at: scenario.get("completed_at"),
+        completed_at,
         merchant_id: scenario.get("merchant_id"),
         requested_by: scenario.get("requested_by"),
+        include_in_history: scenario.get("include_in_history"),
         summary: ScenarioSummary {
             payments_created: summary_row.get("payments_created"),
             events_created: summary_row.get("events_created"),
@@ -889,6 +898,127 @@ pub async fn get_scenario(pool: &PgPool, scenario_id: i64) -> AppResult<Scenario
         step_log: scenario.get("step_log_json"),
         error_message: scenario.get("error_message"),
     })
+}
+
+pub async fn list_scenario_history(
+    pool: &PgPool,
+    query: ScenarioHistoryQuery,
+) -> AppResult<PaginatedScenarioHistoryResponse> {
+    let limit = query.limit.unwrap_or(50).clamp(1, 100);
+    let fetch_limit = limit + 1;
+    let status = normalize_scenario_status(query.status)?;
+    let scenario_key = normalize_scenario_key_filter(query.scenario_key)?;
+    let requested_by = normalize_optional_text(query.requested_by, "requested_by", 200)?;
+    let include_hidden = query.include_hidden.unwrap_or(false);
+
+    let rows = sqlx::query_as::<_, ScenarioHistoryItem>(
+        "SELECT
+            s.scenario_id,
+            s.scenario_key,
+            CASE
+                WHEN s.status = 'failed' THEN 'failed'
+                WHEN COALESCE(delivery_counts.deliveries_created, 0) > 0
+                 AND COALESCE(delivery_counts.active_count, 0) = 0 THEN 'completed'
+                ELSE 'running'
+            END AS status,
+            s.merchant_id,
+            s.requested_by,
+            s.include_in_history,
+            s.started_at,
+            s.completed_at,
+            s.error_message,
+            COALESCE(payment_counts.payments_created, 0)::BIGINT AS payments_created,
+            COALESCE(event_counts.events_created, 0)::BIGINT AS events_created,
+            COALESCE(delivery_counts.deliveries_created, 0)::BIGINT AS deliveries_created,
+            COALESCE(delivery_counts.delivered_count, 0)::BIGINT AS delivered_count,
+            COALESCE(delivery_counts.retrying_count, 0)::BIGINT AS retrying_count,
+            COALESCE(delivery_counts.dead_lettered_count, 0)::BIGINT AS dead_lettered_count
+         FROM (
+            SELECT *
+            FROM scenarios
+            WHERE ($1::BOOLEAN = TRUE OR include_in_history = TRUE)
+              AND ($3::TEXT IS NULL OR scenario_key = $3)
+              AND ($4::TEXT IS NULL OR requested_by = $4)
+              AND ($5::BIGINT IS NULL OR scenario_id < $5)
+         ) s
+         LEFT JOIN LATERAL (
+            SELECT COUNT(*)::BIGINT AS payments_created
+            FROM payments
+            WHERE scenario_id = s.scenario_id
+         ) payment_counts ON TRUE
+         LEFT JOIN LATERAL (
+            SELECT COUNT(*)::BIGINT AS events_created
+            FROM domain_events
+            WHERE scenario_id = s.scenario_id
+         ) event_counts ON TRUE
+         LEFT JOIN LATERAL (
+            SELECT
+                COUNT(*)::BIGINT AS deliveries_created,
+                COUNT(*) FILTER (WHERE status = 'delivered')::BIGINT AS delivered_count,
+                COUNT(*) FILTER (WHERE status = 'retrying')::BIGINT AS retrying_count,
+                COUNT(*) FILTER (WHERE status = 'dead_lettered')::BIGINT AS dead_lettered_count,
+                COUNT(*) FILTER (WHERE status IN ('pending', 'queued', 'processing', 'retrying'))::BIGINT AS active_count
+            FROM webhook_deliveries
+            WHERE scenario_id = s.scenario_id
+         ) delivery_counts ON TRUE
+         WHERE (
+            $2::TEXT IS NULL
+            OR (
+                CASE
+                    WHEN s.status = 'failed' THEN 'failed'
+                    WHEN COALESCE(delivery_counts.deliveries_created, 0) > 0
+                     AND COALESCE(delivery_counts.active_count, 0) = 0 THEN 'completed'
+                    ELSE 'running'
+                END
+            ) = $2
+         )
+         ORDER BY s.scenario_id DESC
+         LIMIT $6",
+    )
+    .bind(include_hidden)
+    .bind(status)
+    .bind(scenario_key)
+    .bind(requested_by)
+    .bind(query.cursor)
+    .bind(fetch_limit)
+    .fetch_all(pool)
+    .await?;
+
+    let mut items = rows;
+    let next_cursor = if items.len() > limit as usize {
+        items.pop().map(|item| item.scenario_id)
+    } else {
+        None
+    };
+
+    Ok(PaginatedScenarioHistoryResponse {
+        items,
+        next_cursor,
+        limit,
+    })
+}
+
+fn normalize_scenario_status(value: Option<String>) -> AppResult<Option<String>> {
+    let Some(value) = normalize_optional_text(value, "status", 50)? else {
+        return Ok(None);
+    };
+    let normalized = value.to_ascii_lowercase();
+    match normalized.as_str() {
+        "running" | "completed" | "failed" => Ok(Some(normalized)),
+        _ => Err(AppError::BadRequest(format!(
+            "unsupported scenario status {}",
+            value
+        ))),
+    }
+}
+
+fn normalize_scenario_key_filter(value: Option<String>) -> AppResult<Option<String>> {
+    let Some(value) = normalize_optional_text(value, "scenario_key", 100)? else {
+        return Ok(None);
+    };
+    resolve_scenario_key(&value)
+        .map(|key| Some(key.to_string()))
+        .ok_or_else(|| AppError::BadRequest(format!("unsupported scenario_key {}", value)))
 }
 
 fn scenario_endpoint_specs(

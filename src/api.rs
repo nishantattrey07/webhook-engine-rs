@@ -54,6 +54,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/events/:event_id", get(get_event))
         .route("/api/events/:event_id/fanout", get(get_event_fanout))
         .route("/api/scenarios", get(list_scenarios))
+        .route("/api/scenarios/history", get(list_scenario_history))
         .route("/api/scenarios/run", post(run_scenario))
         .route("/api/scenarios/:scenario_id", get(get_scenario))
         .route("/api/deliveries", get(list_deliveries))
@@ -239,6 +240,14 @@ async fn list_receiver_behaviors() -> Json<Vec<crate::models::ReceiverBehaviorOp
 
 async fn list_scenarios() -> Json<Vec<crate::models::ScenarioCatalogItem>> {
     Json(services::scenario_catalog())
+}
+
+async fn list_scenario_history(
+    State(state): State<AppState>,
+    Query(query): Query<crate::models::ScenarioHistoryQuery>,
+) -> AppResult<Json<crate::models::PaginatedScenarioHistoryResponse>> {
+    let response = services::list_scenario_history(&state.pool, query).await?;
+    Ok(Json(response))
 }
 
 async fn run_scenario(

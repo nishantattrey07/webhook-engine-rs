@@ -30,8 +30,8 @@ pub use operator_actions::{
 pub use payments::{create_bulk_payments, create_payment};
 pub use scenarios::{
     PlannedScenarioEndpoint, PlannedScenarioRun, build_scenario_run_plan, get_scenario,
-    plan_scenario_endpoints, receiver_behavior_catalog, resolve_receiver_behavior,
-    resolve_scenario_key, run_scenario, scenario_catalog,
+    list_scenario_history, plan_scenario_endpoints, receiver_behavior_catalog,
+    resolve_receiver_behavior, resolve_scenario_key, run_scenario, scenario_catalog,
 };
 #[cfg(test)]
 use trace::build_trace_graph;
