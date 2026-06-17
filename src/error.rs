@@ -21,6 +21,9 @@ pub enum AppError {
     #[error("invalid request: {0}")]
     BadRequest(String),
 
+    #[error("unauthorized: {0}")]
+    Unauthorized(String),
+
     #[error("schema bootstrap timed out while running: {0}")]
     SchemaBootstrapTimeout(String),
 }
@@ -31,6 +34,7 @@ impl IntoResponse for AppError {
             AppError::Database(_) | AppError::Config(_) => StatusCode::INTERNAL_SERVER_ERROR,
             AppError::NotFound(_) => StatusCode::NOT_FOUND,
             AppError::BadRequest(_) => StatusCode::BAD_REQUEST,
+            AppError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             AppError::SchemaBootstrapTimeout(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
 

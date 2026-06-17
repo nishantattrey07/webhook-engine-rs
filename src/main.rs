@@ -13,13 +13,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config = AppConfig::from_env()?;
     let pool = db::connect(&config).await?;
-    db::run_schema_bootstrap(&pool).await?;
+    if config.auto_run_migrations {
+        db::run_schema_bootstrap(&pool).await?;
+    } else {
+        tracing::info!("schema bootstrap skipped; set AUTO_RUN_MIGRATIONS=1 to enable it");
+    }
 
     delivery_worker::spawn(pool.clone(), delivery_worker::WorkerConfig::from_env());
 
     let app = api::router(api::AppState {
         pool,
         mock_receiver_base_url: config.mock_receiver_base_url,
+        cors_allowed_origins: config.cors_allowed_origins,
+        cors_allow_any_origin: config.cors_allow_any_origin,
+        admin_api_key: config.admin_api_key,
     });
     let listener = tokio::net::TcpListener::bind(config.bind_addr).await?;
 

@@ -1,13 +1,20 @@
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
+    http::{
+        HeaderMap, HeaderValue, Method,
+        header::{AUTHORIZATION, CONTENT_TYPE},
+    },
     routing::{get, post},
 };
 use sqlx::PgPool;
-use tower_http::{cors::CorsLayer, trace::TraceLayer};
+use tower_http::{
+    cors::{Any, CorsLayer},
+    trace::TraceLayer,
+};
 
 use crate::{
-    error::AppResult,
+    error::{AppError, AppResult},
     models::{CreatePaymentRequest, HealthResponse},
     services,
 };
@@ -16,9 +23,14 @@ use crate::{
 pub struct AppState {
     pub pool: PgPool,
     pub mock_receiver_base_url: String,
+    pub cors_allowed_origins: Vec<String>,
+    pub cors_allow_any_origin: bool,
+    pub admin_api_key: Option<String>,
 }
 
 pub fn router(state: AppState) -> Router {
+    let cors = cors_layer(&state);
+
     Router::new()
         .route("/health", get(health))
         .route("/api/health", get(health))
@@ -73,8 +85,61 @@ pub fn router(state: AppState) -> Router {
             get(get_delivery_trace_graph),
         )
         .layer(TraceLayer::new_for_http())
-        .layer(CorsLayer::permissive())
+        .layer(cors)
         .with_state(state)
+}
+
+fn cors_layer(state: &AppState) -> CorsLayer {
+    let layer = CorsLayer::new()
+        .allow_methods([Method::GET, Method::POST, Method::PATCH, Method::OPTIONS])
+        .allow_headers([CONTENT_TYPE, AUTHORIZATION]);
+
+    if state.cors_allow_any_origin {
+        layer.allow_origin(Any)
+    } else {
+        let origins = state
+            .cors_allowed_origins
+            .iter()
+            .filter_map(|origin| match HeaderValue::from_str(origin) {
+                Ok(origin) => Some(origin),
+                Err(error) => {
+                    tracing::warn!(%error, origin, "ignoring invalid CORS origin");
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+
+        layer.allow_origin(origins)
+    }
+}
+
+fn ensure_admin_authorized(state: &AppState, headers: &HeaderMap) -> AppResult<()> {
+    let Some(expected_key) = state.admin_api_key.as_deref() else {
+        return Ok(());
+    };
+
+    let Some(header_value) = headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return Err(AppError::Unauthorized(
+            "missing Authorization bearer token".to_string(),
+        ));
+    };
+
+    let Some(actual_key) = header_value.strip_prefix("Bearer ") else {
+        return Err(AppError::Unauthorized(
+            "Authorization must use Bearer token".to_string(),
+        ));
+    };
+
+    if actual_key == expected_key {
+        Ok(())
+    } else {
+        Err(AppError::Unauthorized(
+            "invalid Authorization bearer token".to_string(),
+        ))
+    }
 }
 
 async fn health() -> Json<HealthResponse> {
@@ -83,24 +148,30 @@ async fn health() -> Json<HealthResponse> {
 
 async fn create_payment(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(request): Json<CreatePaymentRequest>,
 ) -> AppResult<Json<crate::models::CreatePaymentResponse>> {
+    ensure_admin_authorized(&state, &headers)?;
     let response = services::create_payment(&state.pool, request).await?;
     Ok(Json(response))
 }
 
 async fn create_bulk_payments(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(request): Json<crate::models::CreateBulkPaymentsRequest>,
 ) -> AppResult<Json<crate::models::CreateBulkPaymentsResponse>> {
+    ensure_admin_authorized(&state, &headers)?;
     let response = services::create_bulk_payments(&state.pool, request).await?;
     Ok(Json(response))
 }
 
 async fn create_endpoint(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(request): Json<crate::models::CreateEndpointRequest>,
 ) -> AppResult<Json<crate::models::CreateEndpointResponse>> {
+    ensure_admin_authorized(&state, &headers)?;
     let response = services::create_endpoint(&state.pool, request).await?;
     Ok(Json(response))
 }
@@ -123,8 +194,10 @@ async fn get_endpoint_detail(
 async fn update_endpoint(
     State(state): State<AppState>,
     Path(endpoint_id): Path<i64>,
+    headers: HeaderMap,
     Json(request): Json<crate::models::UpdateEndpointRequest>,
 ) -> AppResult<Json<crate::models::EndpointListItem>> {
+    ensure_admin_authorized(&state, &headers)?;
     let endpoint = services::update_endpoint(&state.pool, endpoint_id, request).await?;
     Ok(Json(endpoint))
 }
@@ -141,8 +214,10 @@ async fn list_endpoint_deliveries(
 async fn test_endpoint(
     State(state): State<AppState>,
     Path(endpoint_id): Path<i64>,
+    headers: HeaderMap,
     Json(request): Json<crate::models::TestEndpointRequest>,
 ) -> AppResult<Json<crate::models::TestEndpointResponse>> {
+    ensure_admin_authorized(&state, &headers)?;
     let response = services::test_endpoint(&state.pool, endpoint_id, request).await?;
     Ok(Json(response))
 }
@@ -168,8 +243,10 @@ async fn list_scenarios() -> Json<Vec<crate::models::ScenarioCatalogItem>> {
 
 async fn run_scenario(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(request): Json<crate::models::ScenarioRunRequest>,
 ) -> AppResult<Json<crate::models::ScenarioRunResponse>> {
+    ensure_admin_authorized(&state, &headers)?;
     let response =
         services::run_scenario(&state.pool, &state.mock_receiver_base_url, request).await?;
     Ok(Json(response))
@@ -241,16 +318,20 @@ async fn get_delivery_detail(
 async fn retry_delivery(
     State(state): State<AppState>,
     Path(delivery_id): Path<i64>,
+    headers: HeaderMap,
     Json(request): Json<crate::models::RetryDeliveryRequest>,
 ) -> AppResult<Json<crate::models::RetryDeliveryResponse>> {
+    ensure_admin_authorized(&state, &headers)?;
     let response = services::retry_delivery(&state.pool, delivery_id, request).await?;
     Ok(Json(response))
 }
 
 async fn bulk_retry_deliveries(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(request): Json<crate::models::BulkRetryDeliveriesRequest>,
 ) -> AppResult<Json<crate::models::BulkRetryDeliveriesResponse>> {
+    ensure_admin_authorized(&state, &headers)?;
     let response = services::bulk_retry_deliveries(&state.pool, request).await?;
     Ok(Json(response))
 }
@@ -258,8 +339,10 @@ async fn bulk_retry_deliveries(
 async fn resolve_delivery(
     State(state): State<AppState>,
     Path(delivery_id): Path<i64>,
+    headers: HeaderMap,
     Json(request): Json<crate::models::ResolveDeliveryRequest>,
 ) -> AppResult<Json<crate::models::ResolveDeliveryResponse>> {
+    ensure_admin_authorized(&state, &headers)?;
     let response = services::resolve_delivery(&state.pool, delivery_id, request).await?;
     Ok(Json(response))
 }
@@ -267,7 +350,9 @@ async fn resolve_delivery(
 async fn unresolve_delivery(
     State(state): State<AppState>,
     Path(delivery_id): Path<i64>,
+    headers: HeaderMap,
 ) -> AppResult<Json<crate::models::UnresolveDeliveryResponse>> {
+    ensure_admin_authorized(&state, &headers)?;
     let response = services::unresolve_delivery(&state.pool, delivery_id).await?;
     Ok(Json(response))
 }

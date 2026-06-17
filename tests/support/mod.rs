@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::sync::OnceLock;
 
 use axum::{Json, Router, extract::State, routing::post};
