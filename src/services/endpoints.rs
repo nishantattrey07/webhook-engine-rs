@@ -47,6 +47,7 @@ pub async fn create_endpoint(
             )));
         }
     }
+    let enabled = request.enabled.unwrap_or(true);
 
     let mut tx = pool.begin().await?;
 
@@ -60,11 +61,12 @@ pub async fn create_endpoint(
             created_at,
             updated_at
          )
-         VALUES ($1, $2, TRUE, $3, $4, NOW(), NOW())
+         VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
          RETURNING endpoint_id",
     )
     .bind(request.merchant_id)
     .bind(request.url)
+    .bind(enabled)
     .bind(max_attempts)
     .bind(request.description)
     .fetch_one(&mut *tx)

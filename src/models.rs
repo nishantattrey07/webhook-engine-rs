@@ -66,6 +66,7 @@ pub struct CreateEndpointRequest {
     pub merchant_id: i64,
     pub url: String,
     pub secret: String,
+    pub enabled: Option<bool>,
     pub description: Option<String>,
     pub max_attempts: Option<i64>,
     pub subscribed_events: Vec<String>,

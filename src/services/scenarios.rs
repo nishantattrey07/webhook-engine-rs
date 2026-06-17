@@ -473,81 +473,150 @@ async fn setup_scenario(
 ) -> AppResult<()> {
     let mut receiver_configs = Vec::with_capacity(plan.endpoints.len());
     let mut step_log = scenario_plan_step_log(plan);
+    let mut created_endpoint_ids = Vec::with_capacity(plan.endpoints.len());
     persist_scenario_runtime_state(pool, scenario_id, &receiver_configs, &step_log).await?;
 
-    for endpoint in &plan.endpoints {
-        configure_mock_receiver_endpoint(receiver_base_url, plan.merchant_id, endpoint).await?;
-        receiver_configs.push(json!({
-            "merchant_id": plan.merchant_id,
-            "ordinal": endpoint.ordinal,
-            "endpoint_role": endpoint.endpoint_role,
-            "endpoint_key": endpoint.endpoint_key,
-            "behavior_key": endpoint.behavior_key,
-            "behavior": endpoint.behavior,
-            "base_delay_ms": endpoint.base_delay_ms,
-            "max_attempts": endpoint.max_attempts,
-            "event_types": endpoint.event_types
-        }));
+    let setup_result = async {
+        for endpoint in &plan.endpoints {
+            configure_mock_receiver_endpoint(receiver_base_url, plan.merchant_id, endpoint).await?;
+            receiver_configs.push(json!({
+                "merchant_id": plan.merchant_id,
+                "ordinal": endpoint.ordinal,
+                "endpoint_role": endpoint.endpoint_role,
+                "endpoint_key": endpoint.endpoint_key,
+                "behavior_key": endpoint.behavior_key,
+                "behavior": endpoint.behavior,
+                "base_delay_ms": endpoint.base_delay_ms,
+                "max_attempts": endpoint.max_attempts,
+                "event_types": endpoint.event_types
+            }));
 
-        let response = create_endpoint(
-            pool,
-            CreateEndpointRequest {
-                merchant_id: plan.merchant_id,
-                url: format!(
-                    "{}/webhook/{}/{}",
-                    receiver_base_url.trim_end_matches('/'),
-                    plan.merchant_id,
-                    endpoint.endpoint_key
-                ),
-                secret: endpoint.secret.clone(),
-                description: Some(endpoint.description.clone()),
-                max_attempts: Some(endpoint.max_attempts),
-                subscribed_events: endpoint.event_types.clone(),
-            },
-        )
-        .await?;
-        sqlx::query(
-            "UPDATE scenario_run_endpoints
-             SET created_endpoint_id = $3
-             WHERE scenario_id = $1 AND ordinal = $2",
-        )
-        .bind(scenario_id)
-        .bind(endpoint.ordinal)
-        .bind(response.endpoint_id)
-        .execute(pool)
-        .await?;
+            let response = create_endpoint(
+                pool,
+                CreateEndpointRequest {
+                    merchant_id: plan.merchant_id,
+                    url: format!(
+                        "{}/webhook/{}/{}",
+                        receiver_base_url.trim_end_matches('/'),
+                        plan.merchant_id,
+                        endpoint.endpoint_key
+                    ),
+                    secret: endpoint.secret.clone(),
+                    enabled: Some(false),
+                    description: Some(endpoint.description.clone()),
+                    max_attempts: Some(endpoint.max_attempts),
+                    subscribed_events: endpoint.event_types.clone(),
+                },
+            )
+            .await?;
+            created_endpoint_ids.push(response.endpoint_id);
+            sqlx::query(
+                "UPDATE scenario_run_endpoints
+                 SET created_endpoint_id = $3
+                 WHERE scenario_id = $1 AND ordinal = $2",
+            )
+            .bind(scenario_id)
+            .bind(endpoint.ordinal)
+            .bind(response.endpoint_id)
+            .execute(pool)
+            .await?;
+            step_log.push(json!({
+                "step": "endpoint_created",
+                "endpoint_id": response.endpoint_id,
+                "endpoint_key": endpoint.endpoint_key,
+                "ordinal": endpoint.ordinal,
+                "enabled": false
+            }));
+            persist_scenario_runtime_state(pool, scenario_id, &receiver_configs, &step_log).await?;
+        }
+
+        set_scenario_endpoints_enabled(pool, &created_endpoint_ids, true).await?;
         step_log.push(json!({
-            "step": "endpoint_created",
-            "endpoint_id": response.endpoint_id,
-            "endpoint_key": endpoint.endpoint_key,
-            "ordinal": endpoint.ordinal
+            "step": "endpoints_enabled",
+            "endpoint_ids": created_endpoint_ids
         }));
         persist_scenario_runtime_state(pool, scenario_id, &receiver_configs, &step_log).await?;
-    }
 
-    let mut tx = pool.begin().await?;
-    for index in 0..plan.payment_count {
-        let created = create_payment_in_tx(
-            &mut tx,
-            CreatePaymentRequest {
-                merchant_id: plan.merchant_id,
-                order_id: Utc::now().timestamp_micros() + index,
-                amount: 1_000 + index,
-                status: plan.payment_status.clone(),
-                mode_of_payment: "scenario_lab".to_string(),
-            },
-            Some(scenario_id),
+        let mut tx = pool.begin().await?;
+        for index in 0..plan.payment_count {
+            let created = create_payment_in_tx(
+                &mut tx,
+                CreatePaymentRequest {
+                    merchant_id: plan.merchant_id,
+                    order_id: Utc::now().timestamp_micros() + index,
+                    amount: 1_000 + index,
+                    status: plan.payment_status.clone(),
+                    mode_of_payment: "scenario_lab".to_string(),
+                },
+                Some(scenario_id),
+            )
+            .await?;
+            step_log.push(json!({
+                "step": "payment_created",
+                "payment_id": created.payment_id,
+                "event_id": created.event_id,
+                "delivery_count": created.delivery_count
+            }));
+        }
+        tx.commit().await?;
+        persist_scenario_runtime_state(pool, scenario_id, &receiver_configs, &step_log).await?;
+
+        Ok::<(), AppError>(())
+    }
+    .await;
+
+    if let Err(error) = setup_result {
+        cleanup_failed_scenario_setup(
+            pool,
+            scenario_id,
+            &created_endpoint_ids,
+            &receiver_configs,
+            &mut step_log,
         )
         .await?;
-        step_log.push(json!({
-            "step": "payment_created",
-            "payment_id": created.payment_id,
-            "event_id": created.event_id,
-            "delivery_count": created.delivery_count
-        }));
+        return Err(error);
     }
-    tx.commit().await?;
-    persist_scenario_runtime_state(pool, scenario_id, &receiver_configs, &step_log).await?;
+
+    Ok(())
+}
+
+async fn set_scenario_endpoints_enabled(
+    pool: &PgPool,
+    endpoint_ids: &[i64],
+    enabled: bool,
+) -> AppResult<()> {
+    if endpoint_ids.is_empty() {
+        return Ok(());
+    }
+
+    sqlx::query(
+        "UPDATE webhook_endpoints
+         SET enabled = $2,
+             updated_at = NOW()
+         WHERE endpoint_id = ANY($1)",
+    )
+    .bind(endpoint_ids)
+    .bind(enabled)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+async fn cleanup_failed_scenario_setup(
+    pool: &PgPool,
+    scenario_id: i64,
+    created_endpoint_ids: &[i64],
+    receiver_configs: &[serde_json::Value],
+    step_log: &mut Vec<serde_json::Value>,
+) -> AppResult<()> {
+    set_scenario_endpoints_enabled(pool, created_endpoint_ids, false).await?;
+    step_log.push(json!({
+        "step": "setup_cleanup",
+        "action": "disabled_created_endpoints",
+        "endpoint_ids": created_endpoint_ids
+    }));
+    persist_scenario_runtime_state(pool, scenario_id, receiver_configs, step_log).await?;
 
     Ok(())
 }

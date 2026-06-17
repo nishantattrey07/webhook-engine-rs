@@ -133,8 +133,15 @@ async fn run_scenario_persists_plan_and_executes_from_it_when_test_db_is_set()
             Some(6)
         );
         assert_eq!(receiver_config_json.as_array().map(Vec::len), Some(3));
-        assert_eq!(step_log_json.as_array().map(Vec::len), Some(6));
+        assert_eq!(step_log_json.as_array().map(Vec::len), Some(7));
         assert_eq!(step_log_json[0]["step"].as_str(), Some("plan_persisted"));
+        assert!(
+            step_log_json
+                .as_array()
+                .expect("step log array")
+                .iter()
+                .any(|step| step["step"].as_str() == Some("endpoints_enabled"))
+        );
 
         let receiver_requests = receiver.requests.lock().await;
         assert_eq!(receiver_requests.len(), 3);
@@ -143,6 +150,97 @@ async fn run_scenario_persists_plan_and_executes_from_it_when_test_db_is_set()
                 .iter()
                 .all(|request| request["merchant_id"].as_i64() == Some(793_189_338))
         );
+
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await;
+
+    receiver.shutdown().await;
+    result
+}
+
+#[tokio::test]
+async fn failed_scenario_setup_disables_partially_created_endpoints_when_test_db_is_set()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _guard = support::acquire_db_lock().await;
+    let Some(pool) = support::test_pool().await else {
+        return Ok(());
+    };
+
+    let receiver = support::spawn_mock_receiver_that_fails_after(1).await;
+    let result = async {
+        unsafe {
+            std::env::set_var("ALLOW_LOCAL_WEBHOOK_TARGETS", "1");
+        }
+
+        let error = run_scenario(
+            &pool,
+            &receiver.base_url,
+            ScenarioRunRequest {
+                scenario_key: "successful_delivery".to_string(),
+                requested_by: Some("Operator".to_string()),
+                config: Some(ScenarioRunConfig {
+                    merchant_id: Some(793_189_339),
+                    payment_count: Some(1),
+                    endpoint_count: Some(3),
+                    ..ScenarioRunConfig::default()
+                }),
+            },
+        )
+        .await
+        .expect_err("receiver setup failure should fail the scenario run");
+        assert!(
+            error
+                .to_string()
+                .contains("mock receiver endpoint configuration failed")
+        );
+
+        let scenario_row = sqlx::query(
+            "SELECT scenario_id, status, step_log_json
+             FROM scenarios
+             WHERE merchant_id = $1
+             ORDER BY scenario_id DESC
+             LIMIT 1",
+        )
+        .bind(793_189_339_i64)
+        .fetch_one(&pool)
+        .await?;
+        let scenario_id: i64 = scenario_row.get("scenario_id");
+        assert_eq!(scenario_row.get::<&str, _>("status"), "failed");
+
+        let endpoint_rows = sqlx::query(
+            "SELECT e.endpoint_id, e.enabled
+             FROM scenario_run_endpoints sre
+             JOIN webhook_endpoints e ON e.endpoint_id = sre.created_endpoint_id
+             WHERE sre.scenario_id = $1
+             ORDER BY sre.ordinal",
+        )
+        .bind(scenario_id)
+        .fetch_all(&pool)
+        .await?;
+        assert_eq!(endpoint_rows.len(), 1);
+        assert!(!endpoint_rows[0].get::<bool, _>("enabled"));
+
+        let delivery_count: i64 = sqlx::query(
+            "SELECT COUNT(*)::BIGINT AS count
+             FROM webhook_deliveries
+             WHERE scenario_id = $1",
+        )
+        .bind(scenario_id)
+        .fetch_one(&pool)
+        .await?
+        .get("count");
+        assert_eq!(delivery_count, 0);
+
+        let step_log_json: Value = scenario_row.get("step_log_json");
+        let step_log = step_log_json.as_array().expect("step log array");
+        assert!(step_log.iter().any(|step| {
+            step["step"].as_str() == Some("setup_cleanup")
+                && step["action"].as_str() == Some("disabled_created_endpoints")
+        }));
+
+        let receiver_requests = receiver.requests.lock().await;
+        assert_eq!(receiver_requests.len(), 1);
 
         Ok::<(), Box<dyn std::error::Error>>(())
     }

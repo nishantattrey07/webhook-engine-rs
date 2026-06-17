@@ -2,7 +2,7 @@
 
 use std::sync::OnceLock;
 
-use axum::{Json, Router, extract::State, routing::post};
+use axum::{Json, Router, extract::State, http::StatusCode, response::IntoResponse, routing::post};
 use serde_json::{Value, json};
 use sqlx::{PgPool, postgres::PgPoolOptions};
 use tokio::{
@@ -77,10 +77,24 @@ impl MockReceiver {
 }
 
 pub async fn spawn_mock_receiver() -> MockReceiver {
+    spawn_mock_receiver_with_failure(None).await
+}
+
+pub async fn spawn_mock_receiver_that_fails_after(successful_requests: usize) -> MockReceiver {
+    spawn_mock_receiver_with_failure(Some(successful_requests)).await
+}
+
+async fn spawn_mock_receiver_with_failure(
+    fail_after_successful_requests: Option<usize>,
+) -> MockReceiver {
     let requests = std::sync::Arc::new(Mutex::new(Vec::<Value>::new()));
+    let state = MockReceiverState {
+        requests: requests.clone(),
+        fail_after_successful_requests,
+    };
     let app = Router::new()
         .route("/admin/endpoints", post(record_endpoint))
-        .with_state(requests.clone());
+        .with_state(state);
 
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -106,9 +120,26 @@ pub async fn spawn_mock_receiver() -> MockReceiver {
 }
 
 async fn record_endpoint(
-    State(requests): State<std::sync::Arc<Mutex<Vec<Value>>>>,
+    State(state): State<MockReceiverState>,
     Json(payload): Json<Value>,
-) -> Json<Value> {
-    requests.lock().await.push(payload);
-    Json(json!({ "success": true }))
+) -> impl IntoResponse {
+    let mut requests = state.requests.lock().await;
+    if state
+        .fail_after_successful_requests
+        .is_some_and(|limit| requests.len() >= limit)
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "success": false, "error": "forced receiver setup failure" })),
+        );
+    }
+
+    requests.push(payload);
+    (StatusCode::OK, Json(json!({ "success": true })))
+}
+
+#[derive(Clone)]
+struct MockReceiverState {
+    requests: std::sync::Arc<Mutex<Vec<Value>>>,
+    fail_after_successful_requests: Option<usize>,
 }
