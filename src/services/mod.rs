@@ -5,6 +5,7 @@ mod dashboard;
 mod deliveries;
 mod endpoints;
 mod events;
+mod metrics;
 mod operator_actions;
 mod payments;
 mod scenarios;
@@ -24,6 +25,12 @@ pub use endpoints::{
 #[cfg(test)]
 use events::event_search;
 pub use events::{get_event, get_event_fanout, list_events};
+pub use metrics::{
+    get_metrics_dead_letters, get_metrics_delivery_status, get_metrics_endpoints,
+    get_metrics_failures, get_metrics_http_status, get_metrics_latency,
+    get_metrics_lifecycle_funnel, get_metrics_queue, get_metrics_retries, get_metrics_scenarios,
+    get_metrics_summary, get_metrics_throughput,
+};
 pub use operator_actions::{
     bulk_retry_deliveries, resolve_delivery, retry_delivery, unresolve_delivery,
 };

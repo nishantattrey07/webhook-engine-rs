@@ -423,6 +423,232 @@ pub struct RetryBacklogSummary {
     pub due_15_min_plus: i64,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct MetricsQuery {
+    pub range: Option<String>,
+    pub bucket: Option<String>,
+    pub merchant_id: Option<i64>,
+    pub endpoint_id: Option<i64>,
+    pub scenario_id: Option<i64>,
+    pub scenario_key: Option<String>,
+    pub event_type: Option<String>,
+    pub include_hidden: Option<bool>,
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MetricsWindow {
+    pub range: String,
+    pub bucket: String,
+    pub start_at: Option<DateTime<Utc>>,
+    pub end_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MetricsSummaryResponse {
+    pub window: MetricsWindow,
+    pub total_events: i64,
+    pub total_deliveries: i64,
+    pub total_attempts: i64,
+    pub delivered_deliveries: i64,
+    pub dead_lettered_deliveries: i64,
+    pub active_deliveries: i64,
+    pub queue_depth: i64,
+    pub redis_pending: Option<i64>,
+    pub success_rate: Option<f64>,
+    pub failure_rate: Option<f64>,
+    pub retry_rate: Option<f64>,
+    pub p50_latency_ms: Option<f64>,
+    pub p95_latency_ms: Option<f64>,
+    pub p99_latency_ms: Option<f64>,
+    pub retry_backlog: RetryBacklogSummary,
+}
+
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct MetricsThroughputPoint {
+    pub bucket_start: DateTime<Utc>,
+    pub events_created: i64,
+    pub deliveries_created: i64,
+    pub attempts_started: i64,
+    pub payments_created: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MetricsThroughputResponse {
+    pub window: MetricsWindow,
+    pub points: Vec<MetricsThroughputPoint>,
+}
+
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct MetricsDeliveryStatusItem {
+    pub status: String,
+    pub count: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MetricsDeliveryStatusResponse {
+    pub window: MetricsWindow,
+    pub current: Vec<MetricsDeliveryStatusItem>,
+}
+
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct MetricsLatencyPoint {
+    pub bucket_start: DateTime<Utc>,
+    pub attempt_count: i64,
+    pub p50_ms: Option<f64>,
+    pub p95_ms: Option<f64>,
+    pub p99_ms: Option<f64>,
+    pub avg_ms: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct MetricsLatencyHistogramBucket {
+    pub bucket_label: String,
+    pub attempt_count: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MetricsLatencyResponse {
+    pub window: MetricsWindow,
+    pub points: Vec<MetricsLatencyPoint>,
+    pub histogram: Vec<MetricsLatencyHistogramBucket>,
+}
+
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct MetricsFailureOutcomeItem {
+    pub outcome: String,
+    pub count: i64,
+}
+
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct MetricsFailureEndpointItem {
+    pub endpoint_id: i64,
+    pub endpoint_url: String,
+    pub failure_count: i64,
+    pub timeout_count: i64,
+    pub dead_lettered_count: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MetricsFailuresResponse {
+    pub window: MetricsWindow,
+    pub by_outcome: Vec<MetricsFailureOutcomeItem>,
+    pub worst_endpoints: Vec<MetricsFailureEndpointItem>,
+}
+
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct MetricsRetryAttemptDistributionItem {
+    pub attempt_count: i64,
+    pub delivery_count: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MetricsRetriesResponse {
+    pub window: MetricsWindow,
+    pub retry_backlog: RetryBacklogSummary,
+    pub retrying_deliveries: i64,
+    pub manual_retry_deliveries: i64,
+    pub exhausted_deliveries: i64,
+    pub attempt_distribution: Vec<MetricsRetryAttemptDistributionItem>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MetricsQueueResponse {
+    pub window: MetricsWindow,
+    pub pending_due_now: i64,
+    pub queued: i64,
+    pub processing: i64,
+    pub retrying_due_now: i64,
+    pub queue_depth: i64,
+    pub redis_pending: Option<i64>,
+    pub redis_publish_failures: i64,
+    pub stale_queued_recovered: i64,
+    pub stuck_processing_recovered: i64,
+}
+
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct MetricsEndpointItem {
+    pub endpoint_id: i64,
+    pub merchant_id: i64,
+    pub endpoint_url: String,
+    pub enabled: bool,
+    pub delivery_count: i64,
+    pub delivered_count: i64,
+    pub failed_attempt_count: i64,
+    pub dead_lettered_count: i64,
+    pub success_rate: Option<f64>,
+    pub p95_latency_ms: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MetricsEndpointsResponse {
+    pub window: MetricsWindow,
+    pub items: Vec<MetricsEndpointItem>,
+}
+
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct MetricsScenarioItem {
+    pub scenario_key: String,
+    pub run_count: i64,
+    pub completed_count: i64,
+    pub failed_count: i64,
+    pub delivery_count: i64,
+    pub delivered_count: i64,
+    pub dead_lettered_count: i64,
+    pub success_rate: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MetricsScenariosResponse {
+    pub window: MetricsWindow,
+    pub items: Vec<MetricsScenarioItem>,
+}
+
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct MetricsHttpStatusItem {
+    pub status_family: String,
+    pub http_status: Option<i16>,
+    pub attempt_count: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MetricsHttpStatusResponse {
+    pub window: MetricsWindow,
+    pub items: Vec<MetricsHttpStatusItem>,
+}
+
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct MetricsDeadLetterEndpointItem {
+    pub endpoint_id: i64,
+    pub endpoint_url: String,
+    pub dead_lettered_count: i64,
+    pub unresolved_count: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MetricsDeadLettersResponse {
+    pub window: MetricsWindow,
+    pub total_dead_lettered: i64,
+    pub unresolved_dead_lettered: i64,
+    pub resolved_dead_lettered: i64,
+    pub top_endpoints: Vec<MetricsDeadLetterEndpointItem>,
+}
+
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct MetricsLifecycleStepItem {
+    pub step: String,
+    pub status: String,
+    pub count: i64,
+    pub first_seen_at: Option<DateTime<Utc>>,
+    pub last_seen_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MetricsLifecycleFunnelResponse {
+    pub window: MetricsWindow,
+    pub steps: Vec<MetricsLifecycleStepItem>,
+}
+
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct EndpointStatsItem {
     pub endpoint_id: i64,

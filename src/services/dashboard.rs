@@ -136,7 +136,7 @@ pub(crate) fn active_deliveries(queued: i64, processing: i64, retrying: i64) -> 
     queued + processing + retrying
 }
 
-async fn redis_pending_from_runtime() -> Option<i64> {
+pub(crate) async fn redis_pending_from_runtime() -> Option<i64> {
     let config = WorkerConfig::from_env();
 
     if !config.enabled || config.transport != DeliveryTransport::Redis {

@@ -47,6 +47,24 @@ pub fn router(state: AppState) -> Router {
         .route("/api/payments", post(create_payment))
         .route("/api/payments/bulk", post(create_bulk_payments))
         .route("/api/dashboard/summary", get(get_dashboard_summary))
+        .route("/api/metrics/summary", get(get_metrics_summary))
+        .route("/api/metrics/throughput", get(get_metrics_throughput))
+        .route(
+            "/api/metrics/delivery-status",
+            get(get_metrics_delivery_status),
+        )
+        .route("/api/metrics/latency", get(get_metrics_latency))
+        .route("/api/metrics/failures", get(get_metrics_failures))
+        .route("/api/metrics/retries", get(get_metrics_retries))
+        .route("/api/metrics/queue", get(get_metrics_queue))
+        .route("/api/metrics/endpoints", get(get_metrics_endpoints))
+        .route("/api/metrics/scenarios", get(get_metrics_scenarios))
+        .route("/api/metrics/http-status", get(get_metrics_http_status))
+        .route("/api/metrics/dead-letters", get(get_metrics_dead_letters))
+        .route(
+            "/api/metrics/lifecycle-funnel",
+            get(get_metrics_lifecycle_funnel),
+        )
         .route("/api/endpoints/stats", get(list_endpoint_stats))
         .route("/api/event-types", get(list_event_types))
         .route("/api/receiver-behaviors", get(list_receiver_behaviors))
@@ -274,6 +292,102 @@ async fn get_dashboard_summary(
 ) -> AppResult<Json<crate::models::DashboardSummary>> {
     let summary = services::get_dashboard_summary(&state.pool).await?;
     Ok(Json(summary))
+}
+
+async fn get_metrics_summary(
+    State(state): State<AppState>,
+    Query(query): Query<crate::models::MetricsQuery>,
+) -> AppResult<Json<crate::models::MetricsSummaryResponse>> {
+    let response = services::get_metrics_summary(&state.pool, query).await?;
+    Ok(Json(response))
+}
+
+async fn get_metrics_throughput(
+    State(state): State<AppState>,
+    Query(query): Query<crate::models::MetricsQuery>,
+) -> AppResult<Json<crate::models::MetricsThroughputResponse>> {
+    let response = services::get_metrics_throughput(&state.pool, query).await?;
+    Ok(Json(response))
+}
+
+async fn get_metrics_delivery_status(
+    State(state): State<AppState>,
+    Query(query): Query<crate::models::MetricsQuery>,
+) -> AppResult<Json<crate::models::MetricsDeliveryStatusResponse>> {
+    let response = services::get_metrics_delivery_status(&state.pool, query).await?;
+    Ok(Json(response))
+}
+
+async fn get_metrics_latency(
+    State(state): State<AppState>,
+    Query(query): Query<crate::models::MetricsQuery>,
+) -> AppResult<Json<crate::models::MetricsLatencyResponse>> {
+    let response = services::get_metrics_latency(&state.pool, query).await?;
+    Ok(Json(response))
+}
+
+async fn get_metrics_failures(
+    State(state): State<AppState>,
+    Query(query): Query<crate::models::MetricsQuery>,
+) -> AppResult<Json<crate::models::MetricsFailuresResponse>> {
+    let response = services::get_metrics_failures(&state.pool, query).await?;
+    Ok(Json(response))
+}
+
+async fn get_metrics_retries(
+    State(state): State<AppState>,
+    Query(query): Query<crate::models::MetricsQuery>,
+) -> AppResult<Json<crate::models::MetricsRetriesResponse>> {
+    let response = services::get_metrics_retries(&state.pool, query).await?;
+    Ok(Json(response))
+}
+
+async fn get_metrics_queue(
+    State(state): State<AppState>,
+    Query(query): Query<crate::models::MetricsQuery>,
+) -> AppResult<Json<crate::models::MetricsQueueResponse>> {
+    let response = services::get_metrics_queue(&state.pool, query).await?;
+    Ok(Json(response))
+}
+
+async fn get_metrics_endpoints(
+    State(state): State<AppState>,
+    Query(query): Query<crate::models::MetricsQuery>,
+) -> AppResult<Json<crate::models::MetricsEndpointsResponse>> {
+    let response = services::get_metrics_endpoints(&state.pool, query).await?;
+    Ok(Json(response))
+}
+
+async fn get_metrics_scenarios(
+    State(state): State<AppState>,
+    Query(query): Query<crate::models::MetricsQuery>,
+) -> AppResult<Json<crate::models::MetricsScenariosResponse>> {
+    let response = services::get_metrics_scenarios(&state.pool, query).await?;
+    Ok(Json(response))
+}
+
+async fn get_metrics_http_status(
+    State(state): State<AppState>,
+    Query(query): Query<crate::models::MetricsQuery>,
+) -> AppResult<Json<crate::models::MetricsHttpStatusResponse>> {
+    let response = services::get_metrics_http_status(&state.pool, query).await?;
+    Ok(Json(response))
+}
+
+async fn get_metrics_dead_letters(
+    State(state): State<AppState>,
+    Query(query): Query<crate::models::MetricsQuery>,
+) -> AppResult<Json<crate::models::MetricsDeadLettersResponse>> {
+    let response = services::get_metrics_dead_letters(&state.pool, query).await?;
+    Ok(Json(response))
+}
+
+async fn get_metrics_lifecycle_funnel(
+    State(state): State<AppState>,
+    Query(query): Query<crate::models::MetricsQuery>,
+) -> AppResult<Json<crate::models::MetricsLifecycleFunnelResponse>> {
+    let response = services::get_metrics_lifecycle_funnel(&state.pool, query).await?;
+    Ok(Json(response))
 }
 
 async fn list_events(
